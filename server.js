@@ -12,6 +12,11 @@ const db = { prepare: sql => ({ get: async (...p) => (await pool.query(pq(sql), 
 const ready = (async () => {
   await db.exec(`CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT, name TEXT, avatar TEXT);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS first_login TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INTEGER DEFAULT 0;
 CREATE TABLE IF NOT EXISTS spaces(id SERIAL PRIMARY KEY, space_id TEXT, url TEXT, title TEXT, host TEXT, avatar TEXT, start_at TIMESTAMPTZ, owner_id TEXT, demo INTEGER DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now());
 CREATE TABLE IF NOT EXISTS reminders(user_id TEXT, space_row INTEGER, minutes_before INTEGER DEFAULT 15, sent INTEGER DEFAULT 0, PRIMARY KEY(user_id, space_row));
 CREATE TABLE IF NOT EXISTS sessions(sid TEXT PRIMARY KEY, sess JSONB NOT NULL, expire TIMESTAMPTZ NOT NULL);`);
@@ -33,6 +38,17 @@ const app = express(); app.set('trust proxy', 1);
 app.use(express.urlencoded({ extended: false }));
 app.use(async (req, res, next) => { try { await ready; next(); } catch (e) { next(e); } });
 app.use(session({ store: new PgStore(), cookie: { maxAge: 30 * 864e5, secure: 'auto', sameSite: 'lax' }, secret: process.env.SESSION_SECRET || crypto.randomBytes(16).toString('hex'), resave: false, saveUninitialized: false }));
+app.use(async (req, res, next) => {
+  req.isAdmin = false;
+  if (req.session.user && !req.session.csrf) req.session.csrf = crypto.randomBytes(18).toString('base64url');
+  const u = req.session.user;
+  if (u) { const row = await db.prepare('SELECT role,status,username FROM users WHERE id=?').get(u.id).catch(() => null);
+    if (row?.status === 'banned' && !envAdmin(row.username)) { return req.session.destroy(() => res.redirect('/')); }
+    req.isAdmin = envAdmin(u.username) || row?.role === 'admin'; }
+  next();
+});
+const csrfOk = req => { const t = String(req.body?._csrf || ''), c = String(req.session.csrf || ''); return t.length === c.length && t.length > 0 && crypto.timingSafeEqual(Buffer.from(t), Buffer.from(c)); };
+const csrfIn = req => `<input type="hidden" name="_csrf" value="${req.session.csrf}">`;
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 const fmt = iso => new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) + ' (JST)';
 const fmtShort = iso => new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', weekday: 'short', hour: '2-digit', minute: '2-digit' });
@@ -62,15 +78,26 @@ h2{font-size:1rem;color:var(--mut);font-weight:600;margin:26px 0 14px}h2 b{color
 .msg{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}footer{color:var(--ft);font-size:.75rem;text-align:center;margin-top:40px}
 @media(max-width:560px){.wrap{padding:16px 14px 50px}.grid{grid-template-columns:1fr}.card{grid-template-columns:72px 1fr;gap:6px 12px;padding:14px}.date{width:72px;height:80px}.date .d{font-size:1.15rem}.date .h{font-size:.95rem}.thm button{padding:6px 11px}.btn{padding:8px 11px}.hero{padding:30px 0 20px}}`;
 const page = (req, body, hero = false) => `<!doctype html><html lang="ja" data-theme="dark"><meta charset="utf-8"><script>(function(){var m=localStorage.getItem("theme")||"system",q=matchMedia("(prefers-color-scheme: dark)");function a(){var x=localStorage.getItem("theme")||"system";document.documentElement.dataset.theme=x==="system"?(q.matches?"dark":"light"):x;document.documentElement.dataset.mode=x;document.querySelectorAll(".thm button").forEach(function(b){b.setAttribute("aria-pressed",b.dataset.m===x)})}window.setTheme=function(x){localStorage.setItem("theme",x);a()};q.addEventListener("change",a);a();document.addEventListener("DOMContentLoaded",a)})()</script><meta name="viewport" content="width=device-width,initial-scale=1"><title>Spaces Board</title><style>${CSS}</style><body><div class="wrap">
-<nav><a class="logo" href="/"><i>🎙</i><span>Spaces <b>Board</b></span></a><div class="navr"><div class="thm" role="group" aria-label="テーマ"><button type="button" data-m="system" onclick="setTheme('system')">自動</button><button type="button" data-m="light" onclick="setTheme('light')">ライト</button><button type="button" data-m="dark" onclick="setTheme('dark')">ダーク</button></div>${req.session.user ? `<span class="me">@${esc(req.session.user.username)}</span><a class="btn pri" href="/new">＋ スペースを登録</a><a class="btn" href="/logout">ログアウト</a>` : '<a class="btn x" href="/login">𝕏 でログイン</a>'}</div></nav>
+<nav><a class="logo" href="/"><i>🎙</i><span>Spaces <b>Board</b></span></a><div class="navr"><div class="thm" role="group" aria-label="テーマ"><button type="button" data-m="system" onclick="setTheme('system')">自動</button><button type="button" data-m="light" onclick="setTheme('light')">ライト</button><button type="button" data-m="dark" onclick="setTheme('dark')">ダーク</button></div>${req.session.user ? `${req.isAdmin ? '<a class="btn" href="/admin">🛡 管理</a>' : ''}<span class="me">@${esc(req.session.user.username)}</span><a class="btn pri" href="/new">＋ スペースを登録</a><a class="btn" href="/logout">ログアウト</a>` : '<a class="btn x" href="/login">𝕏 でログイン</a>'}</div></nav>
 ${hero ? `<section class="hero"><h1>スペースの予定を、<em>みんなで共有。</em></h1><p>Xスペースの開催予定を登録して一覧で見られる掲示板。気になる回はリマインダーやカレンダーに追加して、聞き逃しを防ごう。</p></section>` : ''}
 ${DEMO ? '<div class="notice">✨ <div><b>デモモード</b>：Xのキー未設定のため、疑似ユーザーでログインし、サンプルデータを表示しています。</div></div>' : ''}
 ${body}<footer>Spaces Board · 時刻はすべて日本時間 (JST)</footer></div></body></html>`;
 const gcal = s => { const f = t => new Date(t).toISOString().replace(/[-:]/g,'').replace(/\.\d{3}/,''); return 'https://calendar.google.com/calendar/render?' + new URLSearchParams({ action: 'TEMPLATE', text: s.title, dates: f(s.start_at) + '/' + f(new Date(s.start_at).getTime() + 3600e3), details: s.url, location: s.url }); };
 const b64u = b => b.toString('base64url');
 const STATE_KEY = process.env.SESSION_SECRET || 'dev-state-key';
+const ADMINS = new Set(String(process.env.ADMIN_USERNAMES || '').split(',').map(x => x.trim().replace(/^@/, '').toLowerCase()).filter(Boolean));
+const envAdmin = u => ADMINS.has(String(u || '').toLowerCase());
+const BANNED_HTML = '<div class="msg">このアカウントは利用停止中です。</div>';
+async function recordLogin(me) {
+  const ex = await db.prepare('SELECT status FROM users WHERE id=?').get(me.id);
+  if (ex?.status === 'banned' && !envAdmin(me.username)) return false;
+  await db.prepare(`INSERT INTO users(id,username,name,avatar,first_login,last_login,login_count) VALUES(?,?,?,?,now(),now(),1)
+    ON CONFLICT(id) DO UPDATE SET username=EXCLUDED.username, name=EXCLUDED.name, avatar=COALESCE(EXCLUDED.avatar, users.avatar), first_login=COALESCE(users.first_login, now()), last_login=now(), login_count=COALESCE(users.login_count,0)+1`).run(me.id, me.username, me.name, me.avatar || null);
+  if (envAdmin(me.username)) await db.prepare("UPDATE users SET role='admin', status='active' WHERE id=?").run(me.id);
+  return true;
+}
 app.get('/login', async (req, res) => {
-  if (DEMO) { req.session.user = { id: 'demo-user', username: 'demo_user', name: 'デモユーザー' }; await db.prepare('INSERT INTO users(id,username,name) VALUES(?,?,?) ON CONFLICT DO NOTHING').run('demo-user','demo_user','デモユーザー'); return req.session.save(() => res.redirect('/')); }
+  if (DEMO) { req.session.user = { id: 'demo-user', username: 'demo_user', name: 'デモユーザー' }; const me = { id: 'demo-user', username: 'demo_user', name: 'デモユーザー' }; if (!(await recordLogin(me))) { req.session.user = null; return res.status(403).send(page(req, BANNED_HTML)); } return req.session.save(() => res.redirect('/')); }
   const verifier = b64u(crypto.randomBytes(32)), payload = verifier + '.' + Date.now();
   const state = payload + '.' + b64u(crypto.createHmac('sha256', STATE_KEY).update(payload).digest());
   const q = new URLSearchParams({ response_type: 'code', client_id: CID, redirect_uri: BASE + '/callback', scope: SCOPES, state,
@@ -87,7 +114,7 @@ app.get('/callback', async (req, res) => {
   const tr = await fetch('https://api.x.com/2/oauth2/token', { method: 'POST', headers, body: new URLSearchParams({ grant_type: 'authorization_code', code: req.query.code, redirect_uri: BASE + '/callback', code_verifier: req.session.verifier, client_id: CID }) });
   const tok = await tr.json().catch(()=>({})); if (!tok.access_token) { console.error('TOKEN_ERROR', tr.status, JSON.stringify({error:tok.error,error_description:tok.error_description,title:tok.title,detail:tok.detail}), 'redirect_uri=', BASE + '/callback', 'cid_prefix=', (CID||'').slice(0,6), 'has_secret=', !!CSEC); return res.status(400).send('token error: ' + (tok.error_description || tok.error || tok.detail || tr.status)); }
   const me = (await (await fetch('https://api.x.com/2/users/me?user.fields=profile_image_url', { headers: { Authorization: 'Bearer ' + tok.access_token } })).json()).data;
-  await db.prepare('INSERT INTO users(id,username,name,avatar) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET username=EXCLUDED.username, name=EXCLUDED.name, avatar=EXCLUDED.avatar').run(me.id, me.username, me.name, me.profile_image_url || null);
+  if (!(await recordLogin({ ...me, avatar: me.profile_image_url }))) return res.status(403).send(page(req, BANNED_HTML));
   req.session.user = me; req.session.token = tok.access_token; // token kept in server-side session only, never logged
   req.session.save(() => res.redirect('/'));
 });
@@ -103,7 +130,7 @@ app.get('/', async (req, res) => {
 <div class="chips">${s.demo ? '<span class="chip s">サンプル</span>' : ''}<span class="chip ${live ? 'live' : soon ? 'soon' : ''}">${live ? '● LIVE' : soon ? '⏰ まもなく' : '📅 予定'}</span></div></div>
 <div class="title">${esc(s.title)}</div><div class="time"><span class="rel">${live ? '配信中' : r}</span><span>🕒 ${fmtShort(s.start_at)} JST</span></div></div>
 <div class="acts"><a class="btn pri" href="${esc(s.url)}" target="_blank" rel="noopener">▶ 開く</a><a class="btn" href="${gcal(s)}" target="_blank" rel="noopener">📅 Googleカレンダー</a><a class="btn" href="/spaces/${s.id}.ics">.ics</a>
-${uid ? `<form method="post" action="/spaces/${s.id}/remind"><button class="btn ${s.rem ? 'on' : ''}">${s.rem ? '🔔 リマインダー中' : '🔕 リマインダー'}</button></form>` : '<a class="btn" href="/login">🔕 リマインダー</a>'}</div></article>`; };
+${uid ? `${uid && (s.owner_id === uid || req.isAdmin) ? `<form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('このスペースを削除しますか？')">${csrfIn(req)}<button class="btn">🗑 削除</button></form>` : ''}<form method="post" action="/spaces/${s.id}/remind"><button class="btn ${s.rem ? 'on' : ''}">${s.rem ? '🔔 リマインダー中' : '🔕 リマインダー'}</button></form>` : '<a class="btn" href="/login">🔕 リマインダー</a>'}</div></article>`; };
   res.send(page(req, `<h2>これからのスペース <b>${rows.length}</b> 件</h2>` + (rows.length ? '<div class="grid">' + rows.map(card).join('') + '</div>' : '<div class="empty">まだ予定がありません。最初のスペースを登録しよう！</div>'), true));
 });
 // Extract a Space id from x.com/i/spaces/ID, twitter.com, reminder/share links (?id=, /spaces/ID/peek), or a bare id.
@@ -167,6 +194,60 @@ app.get('/spaces/:id.ics', async (req, res) => {
   const d = x => new Date(x).toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
   res.type('text/calendar').attachment(`space-${s.id}.ics`).send(['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//SpacesBoard//JA','BEGIN:VEVENT',`UID:space-${s.id}@spaces-board`,`DTSTAMP:${d(Date.now())}`,`DTSTART:${d(s.start_at)}`,`DTEND:${d(new Date(s.start_at).getTime()+3600e3)}`,`SUMMARY:${s.title.replace(/[,;\n]/g,' ')}`,`URL:${s.url}`,`DESCRIPTION:${s.url}`,'BEGIN:VALARM','TRIGGER:-PT15M','ACTION:DISPLAY','DESCRIPTION:スペース開始15分前','END:VALARM','END:VEVENT','END:VCALENDAR'].join('\r\n'));
 });
+app.post('/spaces/:id/delete', auth, async (req, res) => {
+  if (!csrfOk(req)) return res.status(403).send('CSRF error');
+  const s = await db.prepare('SELECT owner_id FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.redirect('/');
+  if (s.owner_id !== req.session.user.id && !req.isAdmin) return res.sendStatus(403);
+  await db.prepare('DELETE FROM reminders WHERE space_row=?').run(+req.params.id); await db.prepare('DELETE FROM spaces WHERE id=?').run(+req.params.id);
+  res.redirect(req.body.back === 'admin' ? '/admin?tab=spaces' : '/');
+});
+// ---- Admin ----
+const admin = (req, res, next) => !req.session.user ? res.redirect('/login') : req.isAdmin ? next() : res.status(403).send(page(req, '<div class="msg">403 · 管理者のみアクセスできます。</div>'));
+const jst = t => t ? new Date(t).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+const USERS_SQL = `SELECT u.*, (SELECT count(*)::int FROM spaces s WHERE s.owner_id=u.id AND s.demo=0) spaces FROM users u WHERE (?::text = '' OR u.username ILIKE '%'||?||'%' OR u.name ILIKE '%'||?||'%') ORDER BY u.last_login DESC NULLS LAST`;
+const SPACES_SQL = `SELECT s.*, u.username owner FROM spaces s LEFT JOIN users u ON u.id=s.owner_id WHERE (?::text = '' OR s.title ILIKE '%'||?||'%' OR s.host ILIKE '%'||?||'%' OR u.username ILIKE '%'||?||'%') ORDER BY s.start_at DESC`;
+const roleOf = u => envAdmin(u.username) || u.role === 'admin' ? 'admin' : 'user';
+const ADMCSS = `<style>.wrap{max-width:1320px}.tabs{display:flex;gap:8px;margin:18px 0;flex-wrap:wrap;align-items:center}.tabs .sp{flex:1}.tabs a.on{background:var(--chbg);border-color:var(--chbd);color:var(--chtx)}.srch{display:flex;gap:8px;flex:1;min-width:220px;max-width:420px}.srch input{flex:1;padding:8px 14px;border-radius:12px;border:1px solid var(--line);background:var(--inp);color:var(--tx);font:inherit}
+.tbl{background:var(--card);border:1px solid var(--line);border-radius:18px;overflow-x:auto;box-shadow:0 6px 24px var(--sh)}table{width:100%;border-collapse:collapse;font-size:.85rem}th,td{padding:12px 14px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:middle}th{color:var(--mut);font-weight:600;font-size:.78rem;background:var(--inp)}tr:last-child td{border-bottom:0}
+.uc{display:flex;gap:10px;align-items:center}.uc .n{font-weight:700}.uc .h{color:var(--mut);font-size:.8rem}.num{font-variant-numeric:tabular-nums;text-align:right}.acts2{display:flex;gap:6px}.acts2 form{margin:0}.acts2 .btn{padding:5px 10px;font-size:.78rem}.btn.dng{color:var(--lvtx);border-color:var(--lvbd)}.chip.ok{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.4);color:#16a34a}.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:10px}.stat div{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px 16px}.stat b{display:block;font-size:1.5rem}.stat span{color:var(--mut);font-size:.8rem}.tl{max-width:320px;overflow:hidden;text-overflow:ellipsis}</style>`;
+const av = (name, url) => `<div class="av">${esc((name || '?')[0].toUpperCase())}${url ? `<img src="${esc(url)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : ''}</div>`;
+app.get('/admin', admin, async (req, res) => {
+  const q = String(req.query.q || '').slice(0, 50), tab = req.query.tab === 'spaces' ? 'spaces' : 'users';
+  const users = await db.prepare(USERS_SQL).all(q, q, q), allU = await db.prepare(USERS_SQL).all('', '', '');
+  const spaces = await db.prepare(SPACES_SQL).all(q, q, q, q);
+  const act = (u, a, label, cls = '') => `<form method="post" action="/admin/users/${encodeURIComponent(u.id)}/${a}">${csrfIn(req)}<button class="btn ${cls}">${label}</button></form>`;
+  const urow = u => { const r = roleOf(u), fixed = envAdmin(u.username), self = u.id === req.session.user.id;
+    return `<tr><td><div class="uc">${av(u.username, u.avatar)}<div><div class="n">${esc(u.name || '')}</div><div class="h">@${esc(u.username)}</div></div></div></td>
+<td><span class="chip ${r === 'admin' ? '' : 's'}">${r === 'admin' ? '🛡 管理者' : '👤 ユーザー'}${fixed ? '（固定）' : ''}</span></td>
+<td><span class="chip ${u.status === 'banned' ? 'live' : 'ok'}">${u.status === 'banned' ? '⛔ 停止中' : '✓ 有効'}</span></td>
+<td>${jst(u.first_login)}</td><td>${jst(u.last_login)}</td><td class="num">${u.login_count || 0}</td><td class="num">${u.spaces}</td>
+<td><div class="acts2">${fixed || self ? '<span class="h" style="color:var(--mut);font-size:.78rem">—</span>' : (r === 'admin' ? act(u, 'demote', '👤 ユーザーにする') : act(u, 'promote', '🛡 管理者にする')) + (u.status === 'banned' ? act(u, 'unban', '✓ 停止解除') : act(u, 'ban', '⛔ 停止', 'dng'))}</div></td></tr>`; };
+  const srow = s => `<tr><td class="tl"><a href="${esc(s.url)}" target="_blank" rel="noopener"><b>${esc(s.title)}</b></a></td><td>@${esc(s.host)}</td><td>${jst(s.start_at)}</td><td>@${esc(s.owner || '')}</td><td>${jst(s.created_at)}</td>
+<td><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="admin"><button class="btn dng" style="padding:5px 10px;font-size:.78rem">🗑 削除</button></form></td></tr>`;
+  const t = (h, rows) => `<div class="tbl"><table><thead><tr>${h.map(x => `<th>${x}</th>`).join('')}</tr></thead><tbody>${rows || `<tr><td colspan="${h.length}" style="text-align:center;color:var(--mut)">該当なし</td></tr>`}</tbody></table></div>`;
+  res.send(page(req, `${ADMCSS}<h2><b>🛡 管理画面</b> · ログインしたXアカウントとスペースの管理</h2>
+<div class="stat"><div><b>${allU.length}</b><span>ユーザー</span></div><div><b>${allU.filter(u => roleOf(u) === 'admin').length}</b><span>管理者</span></div><div><b>${allU.filter(u => u.status === 'banned').length}</b><span>停止中</span></div><div><b>${(await db.prepare('SELECT count(*)::int n FROM spaces WHERE demo=0').get()).n}</b><span>スペース</span></div></div>
+<div class="tabs"><a class="btn ${tab === 'users' ? 'on' : ''}" href="/admin?tab=users">👥 ユーザー</a><a class="btn ${tab === 'spaces' ? 'on' : ''}" href="/admin?tab=spaces">🎙 スペース</a>
+<form class="srch" method="get" action="/admin"><input type="hidden" name="tab" value="${tab}"><input name="q" value="${esc(q)}" placeholder="🔍 検索（ユーザー名・名前・タイトル）"><button class="btn">検索</button></form><span class="sp"></span>
+<a class="btn pri" href="/admin/${tab}.csv">⬇ CSVダウンロード</a></div>
+${tab === 'users' ? t(['アカウント', '権限', '状態', '初回ログイン (JST)', '最終ログイン (JST)', 'ログイン回数', '登録数', '操作'], users.map(urow).join('')) : t(['タイトル', 'ホスト', '開始 (JST)', '登録者', '登録日時 (JST)', '操作'], spaces.map(srow).join(''))}`));
+});
+app.post('/admin/users/:id/:action', admin, async (req, res) => {
+  if (!csrfOk(req)) return res.status(403).send('CSRF error');
+  const u = await db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id); if (!u) return res.redirect('/admin');
+  if (envAdmin(u.username) || u.id === req.session.user.id) return res.status(400).send(page(req, '<div class="msg">このアカウントは変更できません。 <a class="btn" href="/admin">戻る</a></div>'));
+  const sql = { promote: "UPDATE users SET role='admin' WHERE id=?", demote: "UPDATE users SET role='user' WHERE id=?", ban: "UPDATE users SET status='banned' WHERE id=?", unban: "UPDATE users SET status='active' WHERE id=?" }[req.params.action];
+  if (!sql) return res.sendStatus(400);
+  await db.prepare(sql).run(u.id);
+  if (req.params.action === 'ban') await pool.query(`DELETE FROM sessions WHERE sess->'user'->>'id' = $1`, [u.id]);
+  res.redirect('/admin');
+});
+const csvCell = v => { let x = v == null ? '' : String(v); if (/^[=+\-@\t\r]/.test(x)) x = "'" + x; return '"' + x.replace(/"/g, '""') + '"'; };
+const sendCsv = (res, name, head, rows) => { res.type('text/csv; charset=utf-8').attachment(name); res.send('\uFEFF' + [head, ...rows].map(r => r.map(csvCell).join(',')).join('\r\n') + '\r\n'); };
+app.get('/admin/users.csv', admin, async (req, res) => { const rows = await db.prepare(USERS_SQL).all('', '', '');
+  sendCsv(res, 'users.csv', ['X ID', 'ユーザー名', '名前', 'プロフィール画像', '権限', '状態', '初回ログイン(JST)', '最終ログイン(JST)', 'ログイン回数', '登録スペース数'], rows.map(u => [u.id, u.username, u.name, u.avatar, roleOf(u), u.status || 'active', jst(u.first_login), jst(u.last_login), u.login_count || 0, u.spaces])); });
+app.get('/admin/spaces.csv', admin, async (req, res) => { const rows = await db.prepare(SPACES_SQL).all('', '', '', '');
+  sendCsv(res, 'spaces.csv', ['ID', 'スペースID', 'タイトル', 'ホスト', '開始(JST)', 'URL', '登録者', '登録日時(JST)'], rows.map(s => [s.id, s.space_id, s.title, s.host, jst(s.start_at), s.url, s.owner, jst(s.created_at)])); });
 app.get('/healthz', (req, res) => res.json({ ok: true, demo: DEMO }));
 // Reminder job stub: every minute, find due reminders. Delivery channel (email / web push / DM via dm.write) TBD.
 setInterval(async () => { try {
