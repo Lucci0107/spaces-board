@@ -6,7 +6,10 @@ const CID = process.env.X_CLIENT_ID, CSEC = process.env.X_CLIENT_SECRET;
 const DEMO = !CID;
 const SCOPES = 'tweet.read users.read space.read offline.access';
 // Durable storage: Postgres (DATABASE_URL). Render's free disk is wiped on every deploy/restart.
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL || '') ? false : { rejectUnauthorized: false } });
+// SSL: none for localhost/Render-internal hosts (no dot); verified TLS for public hosts like Neon.
+const pgCfg = raw => { if (!raw) return {}; const u = new URL(raw), h = u.hostname; ['sslmode', 'channel_binding', 'uselibpqcompat'].forEach(k => u.searchParams.delete(k));
+  const local = /^(localhost|127\.0\.0\.1)$/.test(h) || !h.includes('.'); return { connectionString: u.toString(), ssl: local ? false : { rejectUnauthorized: !/render\.com$/.test(h) }, max: 5 }; };
+const pool = new Pool(pgCfg(process.env.DATABASE_URL));
 const pq = sql => { let i = 0; return sql.replace(/\?/g, () => '$' + (++i)); };
 const db = { prepare: sql => ({ get: async (...p) => (await pool.query(pq(sql), p)).rows[0], all: async (...p) => (await pool.query(pq(sql), p)).rows, run: async (...p) => pool.query(pq(sql), p) }), exec: sql => pool.query(sql) };
 const ready = (async () => {
@@ -26,6 +29,16 @@ CREATE TABLE IF NOT EXISTS sessions(sid TEXT PRIMARY KEY, sess JSONB NOT NULL, e
       await ins.run('1demo'+i,'https://x.com/i/spaces/1demo'+i,t,u,new Date(Date.now()+h*3600e3).toISOString(),'demo');
   }
   if (!DEMO) await db.exec('DELETE FROM spaces WHERE demo=1');
+  // One-time copy from the previous database (MIGRATE_FROM_URL) when this one has no users yet. Sessions are not copied.
+  if (process.env.MIGRATE_FROM_URL && !(await db.prepare('SELECT 1 FROM users LIMIT 1').get())) {
+    const src = new Pool(pgCfg(process.env.MIGRATE_FROM_URL));
+    try { const n = {};
+      for (const t of ['users', 'spaces', 'reminders']) { const rows = (await src.query(`SELECT * FROM ${t}`)).rows; n[t] = rows.length;
+        for (const r of rows) { const k = Object.keys(r); await pool.query(`INSERT INTO ${t}(${k.join(',')}) VALUES(${k.map((_, i) => '$' + (i + 1)).join(',')}) ON CONFLICT DO NOTHING`, k.map(x => r[x])); } }
+      await pool.query("SELECT setval(pg_get_serial_sequence('spaces','id'), GREATEST((SELECT COALESCE(MAX(id),0) FROM spaces),1))");
+      console.log('MIGRATION_DONE', JSON.stringify(n));
+    } catch (e) { console.error('MIGRATION_ERROR', e.message); } finally { await src.end(); }
+  }
 })();
 // Sessions in Postgres so logins survive restarts/sleep.
 class PgStore extends session.Store {
