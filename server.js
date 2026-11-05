@@ -21,12 +21,22 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS first_login TIMESTAMPTZ;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INTEGER DEFAULT 0;
 CREATE TABLE IF NOT EXISTS spaces(id SERIAL PRIMARY KEY, space_id TEXT, url TEXT, title TEXT, host TEXT, avatar TEXT, start_at TIMESTAMPTZ, owner_id TEXT, demo INTEGER DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now());
+ALTER TABLE spaces ADD COLUMN IF NOT EXISTS has_recording INTEGER DEFAULT 0;
+ALTER TABLE spaces ADD COLUMN IF NOT EXISTS recording_url TEXT;
+ALTER TABLE spaces ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
+ALTER TABLE spaces ADD COLUMN IF NOT EXISTS space_state TEXT;
 CREATE TABLE IF NOT EXISTS reminders(user_id TEXT, space_row INTEGER, minutes_before INTEGER DEFAULT 15, sent INTEGER DEFAULT 0, PRIMARY KEY(user_id, space_row));
 CREATE TABLE IF NOT EXISTS sessions(sid TEXT PRIMARY KEY, sess JSONB NOT NULL, expire TIMESTAMPTZ NOT NULL);`);
   if (DEMO && !(await db.prepare('SELECT 1 FROM spaces WHERE demo=1').get())) {
-    const ins = db.prepare('INSERT INTO spaces(space_id,url,title,host,start_at,owner_id,demo) VALUES(?,?,?,?,?,?,1)');
+    const ins = db.prepare('INSERT INTO spaces(space_id,url,title,host,start_at,owner_id,demo,has_recording,recording_url,space_state,ended_at) VALUES(?,?,?,?,?,?,1,?,?,?,?)');
     for (const [[h,t,u],i] of [[2,'【サンプル】共創ナビ雑談スペース','NiziUcci'],[26,'【サンプル】X API もくもく会','demo_host'],[50,'【サンプル】週末AIトーク','demo_user']].map((x,i)=>[x,i]))
-      await ins.run('1demo'+i,'https://x.com/i/spaces/1demo'+i,t,u,new Date(Date.now()+h*3600e3).toISOString(),'demo');
+      await ins.run('1demo'+i,'https://x.com/i/spaces/1demo'+i,t,u,new Date(Date.now()+h*3600e3).toISOString(),'demo',0,null,'scheduled',null);
+    // Past archives with recording (demo)
+    const past = [[30,'【サンプル】先週の朝活アーカイブ','NiziUcci'],[80,'【サンプル】クリエイター交流アーカイブ','demo_host'],[200,'【サンプル】AIトーク振り返り','demo_user']];
+    for (const [[h,t,u],i] of past.map((x,i)=>[x,i])) {
+      const start = new Date(Date.now()-h*3600e3);
+      await ins.run('1arch'+i,'https://x.com/i/spaces/1arch'+i,t,u,start.toISOString(),'demo',1,'https://x.com/i/spaces/1arch'+i+'/peek','ended',new Date(start.getTime()+3600e3).toISOString());
+    }
   }
   if (!DEMO) await db.exec('DELETE FROM spaces WHERE demo=1');
   // One-time copy from the previous database (MIGRATE_FROM_URL) when this one has no users yet. Sessions are not copied.
@@ -91,7 +101,8 @@ h2{font-size:1rem;color:var(--mut);font-weight:600;margin:26px 0 14px}h2 b{color
 .empty{text-align:center;color:var(--mut);padding:40px;border:1px dashed var(--line);border-radius:18px}
 .form{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:20px;max-width:720px}.form label{display:block;font-size:.85rem;color:var(--mut);margin:12px 0 6px}.form input{width:100%;padding:11px 14px;border-radius:12px;border:1px solid var(--line);background:var(--inp);color:var(--tx);font:inherit}.form input:focus{outline:none;border-color:var(--pu)}
 .msg{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}footer{color:var(--ft);font-size:.75rem;text-align:center;margin-top:40px}
-@media(max-width:560px){.wrap{padding:16px 14px 50px}.grid{grid-template-columns:1fr}.card{grid-template-columns:72px 1fr;gap:6px 12px;padding:14px}.date{width:72px;height:80px}.date .d{font-size:1.15rem}.date .h{font-size:.95rem}.thm button{padding:6px 11px}.btn{padding:8px 11px}.hero{padding:30px 0 20px}}`;
+.btabs{display:inline-flex;gap:4px;border-radius:999px;background:var(--seg);border:1px solid var(--line);padding:4px;margin:0 0 18px;flex-wrap:wrap}.btabs a{border:0;background:none;color:var(--mut);font:inherit;font-size:.9rem;padding:8px 18px;border-radius:999px;cursor:pointer;min-height:36px;display:inline-flex;align-items:center;gap:6px;font-weight:600}.btabs a[aria-selected=true]{background:var(--segon);color:var(--segtx);font-weight:800;box-shadow:0 1px 4px var(--sh)}.btabs .n{font-size:.75rem;opacity:.75;font-variant-numeric:tabular-nums}.chip.arc{background:var(--chbg);border-color:var(--chbd);color:var(--chtx)}.form .chk{display:flex;align-items:center;gap:10px;margin-top:14px;font-size:.9rem;color:var(--tx)}.form .chk input{width:auto;accent-color:var(--pu)}
+@media(max-width:560px){.wrap{padding:16px 14px 50px}.grid{grid-template-columns:1fr}.card{grid-template-columns:72px 1fr;gap:6px 12px;padding:14px}.date{width:72px;height:80px}.date .d{font-size:1.15rem}.date .h{font-size:.95rem}.thm button{padding:6px 11px}.btn{padding:8px 11px}.hero{padding:30px 0 20px}.btabs a{padding:8px 12px;font-size:.82rem}}`;
 const OG_T = 'Spaces Board', OG_D = 'これから始まる Xスペースを、みんなで共有。開始時刻・ホスト・リマインダーをひと目で。';
 const HEAD = `<meta name="description" content="${OG_D}"><link rel="icon" href="/favicon.ico" sizes="32x32"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><link rel="manifest" href="/site.webmanifest"><meta name="theme-color" content="#f7f7fb" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#0a0a10" media="(prefers-color-scheme: dark)">`
  + `<meta property="og:title" content="${OG_T}"><meta property="og:description" content="${OG_D}"><meta property="og:type" content="website"><meta property="og:url" content="${BASE}/"><meta property="og:image" content="${BASE}/og.png"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="Spaces Board — これから始まる Xスペースを、みんなで共有"><meta property="og:site_name" content="Spaces Board"><meta property="og:locale" content="ja_JP">`
@@ -139,18 +150,38 @@ app.get('/callback', async (req, res) => {
 });
 app.get('/logout', (req, res) => req.session.destroy(() => res.redirect('/')));
 const auth = (req, res, next) => req.session.user ? next() : res.redirect('/login');
+const CUTOFF_MS = 3600e3; // keep "live" for 1h after start in upcoming
+const isPast = s => {
+  if (s.space_state === 'ended' || s.ended_at) return true;
+  if (s.space_state === 'live' || s.space_state === 'scheduled') return false;
+  return new Date(s.start_at).getTime() < Date.now() - CUTOFF_MS;
+};
 app.get('/', async (req, res) => {
   const uid = req.session.user?.id;
-  const rows = await db.prepare(`SELECT s.*, u.username owner, (SELECT 1 FROM reminders r WHERE r.space_row=s.id AND r.user_id=?) rem FROM spaces s LEFT JOIN users u ON u.id=s.owner_id WHERE start_at >= ? ORDER BY start_at`).all(uid ?? '', new Date(Date.now() - 3600e3).toISOString());
-  rows.forEach(s => s.start_at = new Date(s.start_at).toISOString());
-  const card = s => { const r = rel(s.start_at), live = r === 'LIVE', soon = !live && (new Date(s.start_at) - Date.now()) < 864e5;
+  const tab = req.query.tab === 'archive' ? 'archive' : 'upcoming';
+  const cutoff = new Date(Date.now() - CUTOFF_MS).toISOString();
+  const base = `SELECT s.*, u.username owner, (SELECT 1 FROM reminders r WHERE r.space_row=s.id AND r.user_id=?) rem FROM spaces s LEFT JOIN users u ON u.id=s.owner_id`;
+  const upcoming = await db.prepare(`${base} WHERE start_at >= ? AND COALESCE(space_state,'') <> 'ended' ORDER BY start_at`).all(uid ?? '', cutoff);
+  const archive = await db.prepare(`${base} WHERE has_recording=1 AND (ended_at IS NOT NULL OR space_state='ended' OR start_at < ?) ORDER BY COALESCE(ended_at, start_at) DESC`).all(uid ?? '', cutoff);
+  const rows = tab === 'archive' ? archive : upcoming;
+  rows.forEach(s => { s.start_at = new Date(s.start_at).toISOString(); if (s.ended_at) s.ended_at = new Date(s.ended_at).toISOString(); });
+  const card = s => { const past = tab === 'archive' || isPast(s); const r = rel(s.start_at), live = !past && r === 'LIVE', soon = !past && !live && (new Date(s.start_at) - Date.now()) < 864e5;
     const dt = new Date(s.start_at), jp = o => dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', ...o });
+    const openUrl = (past && s.recording_url) ? s.recording_url : s.url;
+    const chip = past ? `<span class="chip arc">🎙 アーカイブ</span>` : `<span class="chip ${live ? 'live' : soon ? 'soon' : ''}">${live ? '● LIVE' : soon ? '⏰ まもなく' : '📅 予定'}</span>`;
+    const own = uid && (s.owner_id === uid || req.isAdmin);
     return `<article class="card"><div class="date"><div class="d">${jp({ month: 'numeric', day: 'numeric' })}<small>${jp({ weekday: 'short' })}</small></div><div class="h">${jp({ hour: '2-digit', minute: '2-digit' })}</div></div><div class="body"><div class="top"><div class="av">${esc((s.host || '?')[0].toUpperCase())}<img src="${esc(s.avatar || 'https://unavatar.io/x/' + encodeURIComponent(s.host || ''))}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()"></div><div class="host">@${esc(s.host)}</div>
-<div class="chips">${s.demo ? '<span class="chip s">サンプル</span>' : ''}<span class="chip ${live ? 'live' : soon ? 'soon' : ''}">${live ? '● LIVE' : soon ? '⏰ まもなく' : '📅 予定'}</span></div></div>
-<div class="title">${esc(s.title)}</div><div class="time"><span class="rel">${live ? '配信中' : r}</span><span>🕒 ${fmtShort(s.start_at)} JST</span></div></div>
-<div class="acts"><a class="btn pri" href="${esc(s.url)}" target="_blank" rel="noopener">▶ 開く</a><a class="btn" href="${gcal(s)}" target="_blank" rel="noopener">📅 Googleカレンダー</a><a class="btn" href="/spaces/${s.id}.ics">.ics</a>
-${uid ? `${uid && (s.owner_id === uid || req.isAdmin) ? `<form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('このスペースを削除しますか？')">${csrfIn(req)}<button class="btn">🗑 削除</button></form>` : ''}<form method="post" action="/spaces/${s.id}/remind"><button class="btn ${s.rem ? 'on' : ''}">${s.rem ? '🔔 リマインダー中' : '🔕 リマインダー'}</button></form>` : '<a class="btn" href="/login">🔕 リマインダー</a>'}</div></article>`; };
-  res.send(page(req, `<h2>これからのスペース <b>${rows.length}</b> 件</h2>` + (rows.length ? '<div class="grid">' + rows.map(card).join('') + '</div>' : '<div class="empty">まだ予定がありません。最初のスペースを登録しよう！</div>'), true));
+<div class="chips">${s.demo ? '<span class="chip s">サンプル</span>' : ''}${+s.has_recording && !past ? '<span class="chip arc">🎙 録音予定</span>' : ''}${chip}</div></div>
+<div class="title">${esc(s.title)}</div><div class="time"><span class="rel">${past ? '終了' : live ? '配信中' : r}</span><span>🕒 ${fmtShort(s.start_at)} JST</span></div></div>
+<div class="acts"><a class="btn pri" href="${esc(openUrl)}" target="_blank" rel="noopener">${past ? '▶ 録音を聴く' : '▶ 開く'}</a>${past ? '' : `<a class="btn" href="${gcal(s)}" target="_blank" rel="noopener">📅 Googleカレンダー</a><a class="btn" href="/spaces/${s.id}.ics">.ics</a>`}
+${uid ? `${own ? `<a class="btn" href="/spaces/${s.id}/edit">✏️ 編集</a><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('このスペースを削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="${tab}"><button class="btn">🗑 削除</button></form>` : ''}${past ? '' : `<form method="post" action="/spaces/${s.id}/remind"><input type="hidden" name="back" value="${tab}"><button class="btn ${s.rem ? 'on' : ''}">${s.rem ? '🔔 リマインダー中' : '🔕 リマインダー'}</button></form>`}` : (past ? '' : '<a class="btn" href="/login">🔕 リマインダー</a>')}</div></article>`; };
+  const tabs = `<div class="btabs" role="tablist" aria-label="表示切替"><a role="tab" href="/?tab=upcoming" aria-selected="${tab==='upcoming'}" id="tab-upcoming">これからの予定 <span class="n">${upcoming.length}</span></a><a role="tab" href="/?tab=archive" aria-selected="${tab==='archive'}" id="tab-archive">過去のアーカイブ <span class="n">${archive.length}</span></a></div>
+<script>(function(){var h=location.hash.replace(/^#/, '');if(h==='archive'||h==='upcoming'){if(new URLSearchParams(location.search).get('tab')!==h)location.replace('/?tab='+h);}})()</script>`;
+  const empty = tab === 'archive'
+    ? '<div class="empty">録音ありのアーカイブはまだありません。<br>終了後、登録者が「録音あり」にするとここに表示されます。</div>'
+    : '<div class="empty">まだ予定がありません。最初のスペースを登録しよう！</div>';
+  const heading = tab === 'archive' ? `過去のアーカイブ（録音あり） <b>${rows.length}</b> 件` : `これからのスペース <b>${rows.length}</b> 件`;
+  res.send(page(req, tabs + `<h2>${heading}</h2>` + (rows.length ? '<div class="grid">' + rows.map(card).join('') + '</div>' : empty), true));
 });
 // Extract a Space id from x.com/i/spaces/ID, twitter.com, reminder/share links (?id=, /spaces/ID/peek), or a bare id.
 const spaceIdOf = raw => { const t = String(raw || '').trim(); let m = /spaces\/([A-Za-z0-9]{8,20})/i.exec(t) || /[?&](?:space_?id|id)=([A-Za-z0-9]{8,20})/i.exec(t) || /^([A-Za-z0-9]{8,20})$/.exec(t) || /(?:^|[^A-Za-z0-9])(1[A-Za-z0-9]{12})(?![A-Za-z0-9])/.exec(t); return m ? m[1] : null; };
@@ -159,12 +190,16 @@ const demoSpace = id => { const h = [...crypto.createHash('sha256').update(id).d
   const d = new Date(Date.now() + (1 + h[2] % 6) * 864e5); d.setUTCHours(11 + h[3] % 3, 0, 0, 0); // 20:00-22:00 JST
   return { id, title: `【デモ】${topics[h[0] % topics.length]}`, scheduled_start: d.toISOString(), host: hosts[h[1] % hosts.length], state: 'scheduled', demo: true }; };
 async function lookupSpace(id, token) {
-  const r = await fetch(`https://api.x.com/2/spaces/${encodeURIComponent(id)}?space.fields=title,scheduled_start,started_at,creator_id,state&expansions=creator_id&user.fields=username,profile_image_url`, { headers: { Authorization: 'Bearer ' + token } });
+  // Official space.fields: no recording/replay flag (twitter-api-v2 SpaceV2). Request ended_at + state; if a future field appears on the object, pick it up.
+  const fields = 'title,scheduled_start,started_at,ended_at,creator_id,state,is_ticketed';
+  const r = await fetch(`https://api.x.com/2/spaces/${encodeURIComponent(id)}?space.fields=${fields}&expansions=creator_id&user.fields=username,profile_image_url`, { headers: { Authorization: 'Bearer ' + token } });
   const j = await r.json().catch(() => ({})); if (!r.ok || !j.data) throw new Error('lookup status ' + r.status);
   const cu = j.includes?.users?.find(u => u.id === j.data.creator_id); let host = cu?.username, avatar = cu?.profile_image_url;
   if (!host && j.data.creator_id) { const u = await (await fetch(`https://api.x.com/2/users/${j.data.creator_id}`, { headers: { Authorization: 'Bearer ' + token } })).json().catch(() => ({})); host = u.data?.username; }
   if (host && !avatar) try { avatar = (await (await fetch(`https://api.x.com/2/users/by/username/${encodeURIComponent(host)}?user.fields=profile_image_url`, { headers: { Authorization: 'Bearer ' + token } })).json()).data?.profile_image_url; } catch {}
-  return { id, title: j.data.title || '', scheduled_start: j.data.scheduled_start || j.data.started_at || null, host: host || '', avatar: avatar || null, state: j.data.state };
+  const d = j.data;
+  const replay = d.is_available_for_replay === true || d.isAvailableForReplay === true || d.has_recording === true;
+  return { id, title: d.title || '', scheduled_start: d.scheduled_start || d.started_at || null, ended_at: d.ended_at || null, host: host || '', avatar: avatar || null, state: d.state, has_recording: replay || null };
 }
 app.get('/api/space', auth, async (req, res) => {
   const id = spaceIdOf(req.query.url); if (!id) return res.status(400).json({ error: 'スペースIDが見つかりません。URLを確認してください。' });
@@ -178,7 +213,10 @@ app.get('/new', auth, (req, res) => res.send(page(req, `${NEWCSS}<h2><b>スペ�
 <div class="hint">URLを貼るだけで、タイトル・開始日時・ホストを自動で入力します。${DEMO ? '<br>※デモモードではIDから仮の値を入れます。本物の情報の取得はXでログインすると動きます。' : ''}</div>
 <div class="af" id="af"><div class="row"><span class="st" id="st">読み込み中…</span><button type="button" class="btn" id="ed">✏️ 編集</button></div>
 <div class="pv"><div class="av" id="pa">?</div><div><div class="t" id="pt"></div><div class="m" id="pm"></div></div></div>
-<div id="fields"><label>タイトル</label><input name="title" id="title" readonly><label>開始日時（JST）</label><input type="datetime-local" name="start" id="start" readonly><label>ホスト（@なし）</label><input name="host" id="host" readonly></div></div>
+<div id="fields"><label>タイトル</label><input name="title" id="title" readonly><label>開始日時（JST）</label><input type="datetime-local" name="start" id="start" readonly><label>ホスト（@なし）</label><input name="host" id="host" readonly>
+<label class="chk"><input type="checkbox" name="has_recording" value="1" id="rec"> 録音あり（終了後アーカイブに表示）</label>
+<label for="recording_url">録音URL（任意）</label><input name="recording_url" id="recording_url" placeholder="https://x.com/i/spaces/… または録音のURL" autocomplete="off">
+<div class="hint">X API v2 は録音公開の有無を返さないため、ホスト／登録者が手動で設定します。終了後でも「編集」から変更できます。</div></div></div>
 <div class="acts"><button class="btn pri" id="sb">登録する</button><a class="btn" href="/">キャンセル</a></div></form>
 <script>(function(){var f=document.getElementById('f'),u=document.getElementById('url'),af=document.getElementById('af'),st=document.getElementById('st'),T=document.getElementById('title'),S=document.getElementById('start'),H=document.getElementById('host'),last='',ok=false;
 function ro(v){[T,S,H].forEach(function(i){i.readOnly=v})}
@@ -195,18 +233,23 @@ f.addEventListener('submit',function(e){if(u.value.trim()!==last){e.preventDefau
 app.post('/new', auth, async (req, res) => {
   const id = spaceIdOf(req.body.url); if (!id) return res.status(400).send(page(req, '<div class="msg">スペースIDが見つかりませんでした。URLを確認してください。 <a class="btn" href="/new">戻る</a></div>'));
   let { title, host, start } = req.body, avatar = null; let startIso = start ? new Date(start + '+09:00').toISOString() : null;
-  if (!title || !startIso) try { const sp = DEMO ? demoSpace(id) : req.session.token ? await lookupSpace(id, req.session.token) : null;
-    if (sp) { title = title || sp.title; startIso = startIso || sp.scheduled_start; host = host || sp.host; avatar = sp.avatar || null; } } catch (e) { console.warn('space lookup failed'); }
+  let spaceState = null, endedAt = null, apiRec = false;
+  try { const sp = DEMO ? demoSpace(id) : req.session.token ? await lookupSpace(id, req.session.token) : null;
+    if (sp) { title = title || sp.title; startIso = startIso || sp.scheduled_start; host = host || sp.host; avatar = sp.avatar || null; spaceState = sp.state || null; endedAt = sp.ended_at || null; if (sp.has_recording) apiRec = true; } } catch (e) { console.warn('space lookup failed'); }
   if (!avatar && !DEMO && req.session.token && (host || req.session.user.username)) try { const r = await fetch(`https://api.x.com/2/users/by/username/${encodeURIComponent(host || req.session.user.username)}?user.fields=profile_image_url`, { headers: { Authorization: 'Bearer ' + req.session.token } }); avatar = (await r.json()).data?.profile_image_url || null; } catch {}
   if (!title || !startIso) return res.status(400).send(page(req, '<div class="msg">タイトルと開始日時を取得できませんでした。「編集」から手入力してください。 <a class="btn" href="/new">戻る</a></div>'));
-  await db.prepare('INSERT INTO spaces(space_id,url,title,host,avatar,start_at,owner_id) VALUES(?,?,?,?,?,?,?)').run(id, `https://x.com/i/spaces/${id}`, title, (host || req.session.user.username).replace(/^@/, ''), avatar, startIso, req.session.user.id);
+  const hasRec = (req.body.has_recording === '1' || req.body.has_recording === 'on' || apiRec) ? 1 : 0;
+  let recUrl = String(req.body.recording_url || '').trim() || null;
+  if (recUrl && !/^https?:\/\//i.test(recUrl)) recUrl = null;
+  await db.prepare('INSERT INTO spaces(space_id,url,title,host,avatar,start_at,owner_id,has_recording,recording_url,space_state,ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(id, `https://x.com/i/spaces/${id}`, title, (host || req.session.user.username).replace(/^@/, ''), avatar, startIso, req.session.user.id, hasRec, recUrl, spaceState, endedAt);
   res.redirect('/');
 });
 app.post('/spaces/:id/remind', auth, async (req, res) => {
   const u = req.session.user.id, id = +req.params.id;
   if (await db.prepare('SELECT 1 FROM reminders WHERE user_id=? AND space_row=?').get(u, id)) await db.prepare('DELETE FROM reminders WHERE user_id=? AND space_row=?').run(u, id);
   else await db.prepare('INSERT INTO reminders(user_id,space_row) VALUES(?,?)').run(u, id);
-  res.redirect('/');
+  const back = req.body.back === 'archive' ? '/?tab=archive' : '/';
+  res.redirect(back);
 });
 app.get('/spaces/:id.ics', async (req, res) => {
   const s = await db.prepare('SELECT * FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.sendStatus(404);
@@ -218,7 +261,52 @@ app.post('/spaces/:id/delete', auth, async (req, res) => {
   const s = await db.prepare('SELECT owner_id FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.redirect('/');
   if (s.owner_id !== req.session.user.id && !req.isAdmin) return res.sendStatus(403);
   await db.prepare('DELETE FROM reminders WHERE space_row=?').run(+req.params.id); await db.prepare('DELETE FROM spaces WHERE id=?').run(+req.params.id);
-  res.redirect(req.body.back === 'admin' ? '/admin?tab=spaces' : '/');
+  const back = req.body.back === 'admin' ? '/admin?tab=spaces' : req.body.back === 'archive' ? '/?tab=archive' : '/';
+  res.redirect(back);
+});
+// ---- Edit space (owner / admin): mark recording, fix metadata ----
+app.get('/spaces/:id/edit', auth, async (req, res) => {
+  const s = await db.prepare('SELECT * FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.status(404).send(page(req, '<div class="msg">見つかりません。</div>'));
+  if (s.owner_id !== req.session.user.id && !req.isAdmin) return res.status(403).send(page(req, '<div class="msg">403 · 登録者または管理者のみ編集できます。</div>'));
+  const startLocal = (() => { const d = new Date(new Date(s.start_at).getTime() + 9 * 36e5); return d.toISOString().slice(0, 16); })();
+  res.send(page(req, `${NEWCSS}<h2><b>スペースを編集</b></h2><form class="form" method="post" action="/spaces/${s.id}/edit">
+${csrfIn(req)}
+<label>タイトル</label><input name="title" value="${esc(s.title)}" required>
+<label>開始日時（JST）</label><input type="datetime-local" name="start" value="${esc(startLocal)}" required>
+<label>ホスト（@なし）</label><input name="host" value="${esc(s.host || '')}">
+<label class="chk"><input type="checkbox" name="has_recording" value="1" ${+s.has_recording ? 'checked' : ''}> 録音あり（過去のアーカイブに表示）</label>
+<label>録音URL（任意）</label><input name="recording_url" value="${esc(s.recording_url || '')}" placeholder="https://…">
+<div class="hint">X API は録音の有無を返さないため、ここで手動設定します。終了済み＋録音ありのときだけアーカイブタブに出ます。</div>
+<div class="acts"><button class="btn pri">保存する</button><a class="btn" href="/">キャンセル</a>
+<button class="btn" formaction="/spaces/${s.id}/refresh" formmethod="post">↻ Xから状態を更新</button></div></form>`));
+});
+app.post('/spaces/:id/edit', auth, async (req, res) => {
+  if (!csrfOk(req)) return res.status(403).send('CSRF error');
+  const s = await db.prepare('SELECT * FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.redirect('/');
+  if (s.owner_id !== req.session.user.id && !req.isAdmin) return res.sendStatus(403);
+  const title = String(req.body.title || '').trim(); const host = String(req.body.host || '').replace(/^@/, '').trim();
+  const startIso = req.body.start ? new Date(req.body.start + '+09:00').toISOString() : null;
+  if (!title || !startIso) return res.status(400).send(page(req, '<div class="msg">タイトルと開始日時は必須です。 <a class="btn" href="/spaces/' + s.id + '/edit">戻る</a></div>'));
+  const hasRec = req.body.has_recording === '1' || req.body.has_recording === 'on' ? 1 : 0;
+  let recUrl = String(req.body.recording_url || '').trim() || null;
+  if (recUrl && !/^https?:\/\//i.test(recUrl)) recUrl = null;
+  await db.prepare('UPDATE spaces SET title=?, host=?, start_at=?, has_recording=?, recording_url=? WHERE id=?').run(title, host || s.host, startIso, hasRec, recUrl, s.id);
+  res.redirect(hasRec && isPast({ ...s, start_at: startIso, has_recording: hasRec }) ? '/?tab=archive' : '/');
+});
+app.post('/spaces/:id/refresh', auth, async (req, res) => {
+  if (!csrfOk(req)) return res.status(403).send('CSRF error');
+  const s = await db.prepare('SELECT * FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.redirect('/');
+  if (s.owner_id !== req.session.user.id && !req.isAdmin) return res.sendStatus(403);
+  if (DEMO || !req.session.token) return res.redirect('/spaces/' + s.id + '/edit');
+  try {
+    const sp = await lookupSpace(s.space_id, req.session.token);
+    const patch = { space_state: sp.state || s.space_state, ended_at: sp.ended_at || s.ended_at, title: s.title || sp.title, host: s.host || sp.host };
+    // Only auto-set has_recording when API explicitly says so (rare); never clear a manual flag.
+    let hasRec = +s.has_recording; if (sp.has_recording === true) hasRec = 1;
+    await db.prepare('UPDATE spaces SET space_state=?, ended_at=?, title=COALESCE(NULLIF(?,\'\'), title), host=COALESCE(NULLIF(?,\'\'), host), avatar=COALESCE(?, avatar), has_recording=? WHERE id=?')
+      .run(patch.space_state, patch.ended_at, sp.title || '', sp.host || '', sp.avatar || null, hasRec, s.id);
+  } catch (e) { console.warn('refresh failed', e.message); }
+  res.redirect('/spaces/' + s.id + '/edit');
 });
 // ---- Admin ----
 const admin = (req, res, next) => !req.session.user ? res.redirect('/login') : req.isAdmin ? next() : res.status(403).send(page(req, '<div class="msg">403 · 管理者のみアクセスできます。</div>'));
@@ -241,7 +329,7 @@ app.get('/admin', admin, async (req, res) => {
 <td><span class="chip ${u.status === 'banned' ? 'live' : 'ok'}">${u.status === 'banned' ? '⛔ 停止中' : '✓ 有効'}</span></td>
 <td>${jst(u.first_login)}</td><td>${jst(u.last_login)}</td><td class="num">${u.login_count || 0}</td><td class="num">${u.spaces}</td>
 <td><div class="acts2">${fixed || self ? '<span class="h" style="color:var(--mut);font-size:.78rem">—</span>' : (r === 'admin' ? act(u, 'demote', '👤 ユーザーにする') : act(u, 'promote', '🛡 管理者にする')) + (u.status === 'banned' ? act(u, 'unban', '✓ 停止解除') : act(u, 'ban', '⛔ 停止', 'dng'))}</div></td></tr>`; };
-  const srow = s => `<tr><td class="tl"><a href="${esc(s.url)}" target="_blank" rel="noopener"><b>${esc(s.title)}</b></a></td><td>@${esc(s.host)}</td><td>${jst(s.start_at)}</td><td>@${esc(s.owner || '')}</td><td>${jst(s.created_at)}</td>
+  const srow = s => `<tr><td class="tl"><a href="${esc(s.url)}" target="_blank" rel="noopener"><b>${esc(s.title)}</b></a></td><td>@${esc(s.host)}</td><td>${jst(s.start_at)}</td><td>${+s.has_recording ? '🎙 あり' : '—'}</td><td>@${esc(s.owner || '')}</td><td>${jst(s.created_at)}</td>
 <td><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="admin"><button class="btn dng" style="padding:5px 10px;font-size:.78rem">🗑 削除</button></form></td></tr>`;
   const t = (h, rows) => `<div class="tbl"><table><thead><tr>${h.map(x => `<th>${x}</th>`).join('')}</tr></thead><tbody>${rows || `<tr><td colspan="${h.length}" style="text-align:center;color:var(--mut)">該当なし</td></tr>`}</tbody></table></div>`;
   res.send(page(req, `${ADMCSS}<h2><b>🛡 管理画面</b> · ログインしたXアカウントとスペースの管理</h2>
@@ -249,7 +337,7 @@ app.get('/admin', admin, async (req, res) => {
 <div class="tabs"><a class="btn ${tab === 'users' ? 'on' : ''}" href="/admin?tab=users">👥 ユーザー</a><a class="btn ${tab === 'spaces' ? 'on' : ''}" href="/admin?tab=spaces">🎙 スペース</a>
 <form class="srch" method="get" action="/admin"><input type="hidden" name="tab" value="${tab}"><input name="q" value="${esc(q)}" placeholder="🔍 検索（ユーザー名・名前・タイトル）"><button class="btn">検索</button></form><span class="sp"></span>
 <a class="btn pri" href="/admin/${tab}.csv">⬇ CSVダウンロード</a></div>
-${tab === 'users' ? t(['アカウント', '権限', '状態', '初回ログイン (JST)', '最終ログイン (JST)', 'ログイン回数', '登録数', '操作'], users.map(urow).join('')) : t(['タイトル', 'ホスト', '開始 (JST)', '登録者', '登録日時 (JST)', '操作'], spaces.map(srow).join(''))}`));
+${tab === 'users' ? t(['アカウント', '権限', '状態', '初回ログイン (JST)', '最終ログイン (JST)', 'ログイン回数', '登録数', '操作'], users.map(urow).join('')) : t(['タイトル', 'ホスト', '開始 (JST)', '録音', '登録者', '登録日時 (JST)', '操作'], spaces.map(srow).join(''))}`));
 });
 app.post('/admin/users/:id/:action', admin, async (req, res) => {
   if (!csrfOk(req)) return res.status(403).send('CSRF error');
@@ -266,12 +354,16 @@ const sendCsv = (res, name, head, rows) => { res.type('text/csv; charset=utf-8')
 app.get('/admin/users.csv', admin, async (req, res) => { const rows = await db.prepare(USERS_SQL).all('', '', '');
   sendCsv(res, 'users.csv', ['X ID', 'ユーザー名', '名前', 'プロフィール画像', '権限', '状態', '初回ログイン(JST)', '最終ログイン(JST)', 'ログイン回数', '登録スペース数'], rows.map(u => [u.id, u.username, u.name, u.avatar, roleOf(u), u.status || 'active', jst(u.first_login), jst(u.last_login), u.login_count || 0, u.spaces])); });
 app.get('/admin/spaces.csv', admin, async (req, res) => { const rows = await db.prepare(SPACES_SQL).all('', '', '', '');
-  sendCsv(res, 'spaces.csv', ['ID', 'スペースID', 'タイトル', 'ホスト', '開始(JST)', 'URL', '登録者', '登録日時(JST)'], rows.map(s => [s.id, s.space_id, s.title, s.host, jst(s.start_at), s.url, s.owner, jst(s.created_at)])); });
+  sendCsv(res, 'spaces.csv', ['ID', 'スペースID', 'タイトル', 'ホスト', '開始(JST)', 'URL', '録音あり', '録音URL', '状態', '登録者', '登録日時(JST)'], rows.map(s => [s.id, s.space_id, s.title, s.host, jst(s.start_at), s.url, +s.has_recording ? 'yes' : 'no', s.recording_url || '', s.space_state || '', s.owner, jst(s.created_at)])); });
 app.get('/healthz', (req, res) => res.json({ ok: true, demo: DEMO }));
 // Reminder job stub: every minute, find due reminders. Delivery channel (email / web push / DM via dm.write) TBD.
 setInterval(async () => { try {
   const due = await db.prepare(`SELECT r.user_id, r.space_row, s.title, s.start_at, u.username FROM reminders r JOIN spaces s ON s.id=r.space_row JOIN users u ON u.id=r.user_id WHERE r.sent=0 AND s.start_at - make_interval(mins => r.minutes_before) <= now()`).all();
   for (const r of due) { console.log(`[reminder stub] @${r.username}: 「${r.title}」 ${fmt(r.start_at)}`); await db.prepare('UPDATE reminders SET sent=1 WHERE user_id=? AND space_row=?').run(r.user_id, r.space_row); }
-  await pool.query('DELETE FROM sessions WHERE expire<now()'); } catch (e) { console.error('reminder job', e.message); }
+  await pool.query('DELETE FROM sessions WHERE expire<now()');
+  // Mark clearly-past spaces as ended when no fresher state (keeps archive eligibility without deleting rows).
+  await pool.query(`UPDATE spaces SET space_state='ended', ended_at=COALESCE(ended_at, start_at + interval '1 hour')
+    WHERE COALESCE(space_state,'') NOT IN ('ended','canceled') AND start_at < now() - interval '3 hours'`);
+} catch (e) { console.error('reminder job', e.message); }
 }, 60e3);
 app.listen(PORT, () => console.log(`Spaces Board on ${BASE} (demo=${DEMO})`));
