@@ -1,28 +1,43 @@
 // Spaces Board MVP. Credentials only from env: X_CLIENT_ID, X_CLIENT_SECRET (optional), BASE_URL, SESSION_SECRET.
 const express = require('express'), session = require('express-session'), crypto = require('crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { Pool } = require('pg');
 const PORT = process.env.PORT || 3000, BASE = process.env.BASE_URL || `http://localhost:${PORT}`;
 const CID = process.env.X_CLIENT_ID, CSEC = process.env.X_CLIENT_SECRET;
 const DEMO = !CID;
 const SCOPES = 'tweet.read users.read space.read offline.access';
-const db = new DatabaseSync(process.env.DB_PATH || 'spaces.db');
-db.exec(`CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT, name TEXT);
-CREATE TABLE IF NOT EXISTS spaces(id INTEGER PRIMARY KEY AUTOINCREMENT, space_id TEXT, url TEXT, title TEXT, host TEXT, start_at TEXT, owner_id TEXT, demo INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS reminders(user_id TEXT, space_row INTEGER, minutes_before INTEGER DEFAULT 15, sent INTEGER DEFAULT 0, PRIMARY KEY(user_id, space_row));`);
-if (DEMO && !db.prepare('SELECT 1 FROM spaces WHERE demo=1').get()) {
-  const ins = db.prepare('INSERT INTO spaces(space_id,url,title,host,start_at,owner_id,demo) VALUES(?,?,?,?,?,?,1)');
-  [[2,'【サンプル】共創ナビ雑談スペース','NiziUcci'],[26,'【サンプル】X API もくもく会','demo_host'],[50,'【サンプル】週末AIトーク','demo_user']]
-    .forEach(([h,t,u],i)=>ins.run('1demo'+i,'https://x.com/i/spaces/1demo'+i,t,u,new Date(Date.now()+h*3600e3).toISOString(),'demo'));
+// Durable storage: Postgres (DATABASE_URL). Render's free disk is wiped on every deploy/restart.
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL || '') ? false : { rejectUnauthorized: false } });
+const pq = sql => { let i = 0; return sql.replace(/\?/g, () => '$' + (++i)); };
+const db = { prepare: sql => ({ get: async (...p) => (await pool.query(pq(sql), p)).rows[0], all: async (...p) => (await pool.query(pq(sql), p)).rows, run: async (...p) => pool.query(pq(sql), p) }), exec: sql => pool.query(sql) };
+const ready = (async () => {
+  await db.exec(`CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT, name TEXT, avatar TEXT);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;
+CREATE TABLE IF NOT EXISTS spaces(id SERIAL PRIMARY KEY, space_id TEXT, url TEXT, title TEXT, host TEXT, avatar TEXT, start_at TIMESTAMPTZ, owner_id TEXT, demo INTEGER DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now());
+CREATE TABLE IF NOT EXISTS reminders(user_id TEXT, space_row INTEGER, minutes_before INTEGER DEFAULT 15, sent INTEGER DEFAULT 0, PRIMARY KEY(user_id, space_row));
+CREATE TABLE IF NOT EXISTS sessions(sid TEXT PRIMARY KEY, sess JSONB NOT NULL, expire TIMESTAMPTZ NOT NULL);`);
+  if (DEMO && !(await db.prepare('SELECT 1 FROM spaces WHERE demo=1').get())) {
+    const ins = db.prepare('INSERT INTO spaces(space_id,url,title,host,start_at,owner_id,demo) VALUES(?,?,?,?,?,?,1)');
+    for (const [[h,t,u],i] of [[2,'【サンプル】共創ナビ雑談スペース','NiziUcci'],[26,'【サンプル】X API もくもく会','demo_host'],[50,'【サンプル】週末AIトーク','demo_user']].map((x,i)=>[x,i]))
+      await ins.run('1demo'+i,'https://x.com/i/spaces/1demo'+i,t,u,new Date(Date.now()+h*3600e3).toISOString(),'demo');
+  }
+  if (!DEMO) await db.exec('DELETE FROM spaces WHERE demo=1');
+})();
+// Sessions in Postgres so logins survive restarts/sleep.
+class PgStore extends session.Store {
+  get(sid, cb) { pool.query('SELECT sess FROM sessions WHERE sid=$1 AND expire>now()', [sid]).then(r => cb(null, r.rows[0]?.sess || null), cb); }
+  set(sid, sess, cb) { const exp = new Date(Date.now() + (sess.cookie?.maxAge || 30 * 864e5)); pool.query('INSERT INTO sessions VALUES($1,$2,$3) ON CONFLICT(sid) DO UPDATE SET sess=$2, expire=$3', [sid, sess, exp]).then(() => cb && cb(), cb); }
+  destroy(sid, cb) { pool.query('DELETE FROM sessions WHERE sid=$1', [sid]).then(() => cb && cb(), cb); }
+  touch(sid, sess, cb) { this.set(sid, sess, cb); }
 }
 const app = express(); app.set('trust proxy', 1);
-if (!DEMO) db.exec('DELETE FROM spaces WHERE demo=1');
 app.use(express.urlencoded({ extended: false }));
-app.use(session({ secret: process.env.SESSION_SECRET || crypto.randomBytes(16).toString('hex'), resave: false, saveUninitialized: false }));
+app.use(async (req, res, next) => { try { await ready; next(); } catch (e) { next(e); } });
+app.use(session({ store: new PgStore(), cookie: { maxAge: 30 * 864e5, secure: 'auto', sameSite: 'lax' }, secret: process.env.SESSION_SECRET || crypto.randomBytes(16).toString('hex'), resave: false, saveUninitialized: false }));
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 const fmt = iso => new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) + ' (JST)';
 const fmtShort = iso => new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', weekday: 'short', hour: '2-digit', minute: '2-digit' });
 const rel = iso => { const m = Math.round((new Date(iso) - Date.now()) / 60e3); if (m <= 0 && m > -60) return 'LIVE'; if (m < 60) return `あと${m}分`; if (m < 1440) return `あと${Math.round(m/60)}時間`; return `あと${Math.round(m/1440)}日`; };
-const CSS = `:root,[data-theme=dark]{color-scheme:dark;--bg:#0a0a10;--card:#13131c;--line:#262634;--tx:#f1f1f6;--mut:#9b9bb0;--pu:#8b5cf6;--bl:#3b82f6;--pk:#ec4899;--glow:rgba(139,92,246,.16);--btn:#171722;--btnh:#1f1a30;--onbg:#2a1830;--ontx:#f5c2e7;--ntx:#d4ccf5;--sh:rgba(0,0,0,.35);--chbg:rgba(139,92,246,.12);--chbd:#6d4fd8;--chtx:#c4b5fd;--lvbg:#3b0d1d;--lvbd:#be185d;--lvtx:#fda4af;--sbg:#221b08;--sbd:#5c4a14;--stx:#fcd34d;--time:#a9a9be;--inp:#0e0e16;--ft:#5c5c75;--xbg:#ffffff;--xtx:#0a0a10;--seg:#14141d;--segon:#2a2a38;--segtx:#f1f1f6;--logo:#a78bfa}
+const CSS = `.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}:root,[data-theme=dark]{color-scheme:dark;--bg:#0a0a10;--card:#13131c;--line:#262634;--tx:#f1f1f6;--mut:#9b9bb0;--pu:#8b5cf6;--bl:#3b82f6;--pk:#ec4899;--glow:rgba(139,92,246,.16);--btn:#171722;--btnh:#1f1a30;--onbg:#2a1830;--ontx:#f5c2e7;--ntx:#d4ccf5;--sh:rgba(0,0,0,.35);--chbg:rgba(139,92,246,.12);--chbd:#6d4fd8;--chtx:#c4b5fd;--lvbg:#3b0d1d;--lvbd:#be185d;--lvtx:#fda4af;--sbg:#221b08;--sbd:#5c4a14;--stx:#fcd34d;--time:#a9a9be;--inp:#0e0e16;--ft:#5c5c75;--xbg:#ffffff;--xtx:#0a0a10;--seg:#14141d;--segon:#2a2a38;--segtx:#f1f1f6;--logo:#a78bfa}
 [data-theme=light]{color-scheme:light;--bg:#f7f7fb;--card:#ffffff;--line:#e6e5ef;--tx:#14132a;--mut:#5f5d78;--pu:#7c3aed;--bl:#3b82f6;--pk:#db2777;--glow:rgba(124,58,237,.07);--btn:#ffffff;--btnh:#f5f1ff;--onbg:#fde7f3;--ontx:#9d174d;--ntx:#4c1d95;--sh:rgba(40,30,90,.07);--chbg:#f1ecff;--chbd:#e2d8fe;--chtx:#6d28d9;--lvbg:#ffe4ec;--lvbd:#f9a8c4;--lvtx:#be123c;--sbg:#fef6dc;--sbd:#f3d77a;--stx:#92600a;--time:#4b4a63;--inp:#f9f8fd;--ft:#8a88a3;--xbg:#0a0a10;--xtx:#ffffff;--seg:#ecebf3;--segon:#ffffff;--segtx:#14132a;--logo:#7c3aed}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 500px at 15% -10%,var(--glow) 0,transparent 60%),var(--bg);color:var(--tx);font-family:Inter,"Hiragino Sans","Noto Sans JP","Yu Gothic UI",system-ui,sans-serif;line-height:1.6;min-height:100vh;-webkit-font-smoothing:antialiased}
 a{color:inherit;text-decoration:none}.wrap{max-width:1080px;margin:auto;padding:22px 20px 60px}
@@ -37,7 +52,7 @@ h2{font-size:1rem;color:var(--mut);font-weight:600;margin:26px 0 14px}h2 b{color
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:18px}
 .card{display:grid;grid-template-columns:96px 1fr;gap:6px 18px;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 6px 24px var(--sh);transition:.2s}.card:hover{border-color:var(--chbd);transform:translateY(-2px)}
 .date{width:96px;height:100px;border-radius:14px;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;background:linear-gradient(160deg,#a855f7,#6366f1);box-shadow:0 6px 16px rgba(124,58,237,.25);line-height:1.15}.card:nth-child(2n) .date{background:linear-gradient(160deg,#60a5fa,#4f46e5)}.date .d{font-size:1.5rem;font-weight:800}.date .d small{font-size:.9rem;margin-left:2px}.date .h{font-size:1.15rem;font-weight:600;margin-top:6px}
-.body{min-width:0}.top{display:flex;gap:10px;align-items:center}.av{flex:none;width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font-weight:800;color:#fff;background:linear-gradient(135deg,var(--pu),var(--pk));border:2px solid var(--card);box-shadow:0 0 0 1px var(--line)}
+.body{min-width:0}.top{display:flex;gap:10px;align-items:center}.av{position:relative;overflow:hidden;flex:none;width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font-weight:800;color:#fff;background:linear-gradient(135deg,var(--pu),var(--pk));border:2px solid var(--card);box-shadow:0 0 0 1px var(--line)}
 .host{font-size:.9rem;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chips{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .chip{font-size:.75rem;padding:3px 12px;border-radius:999px;background:var(--chbg);border:1px solid var(--chbd);color:var(--chtx);white-space:nowrap;font-weight:600}.chip.live{background:var(--lvbg);border-color:var(--lvbd);color:var(--lvtx)}.chip.s{color:var(--stx);border-color:var(--sbd);background:var(--sbg)}
 .title{font-size:1.15rem;font-weight:800;margin:10px 0 4px;line-height:1.45;word-break:break-word}.time{color:var(--time);font-size:.88rem;display:flex;gap:10px;flex-wrap:wrap}.time .rel{color:var(--chtx);font-weight:700}
@@ -54,8 +69,8 @@ ${body}<footer>Spaces Board · 時刻はすべて日本時間 (JST)</footer></di
 const gcal = s => { const f = t => new Date(t).toISOString().replace(/[-:]/g,'').replace(/\.\d{3}/,''); return 'https://calendar.google.com/calendar/render?' + new URLSearchParams({ action: 'TEMPLATE', text: s.title, dates: f(s.start_at) + '/' + f(new Date(s.start_at).getTime() + 3600e3), details: s.url, location: s.url }); };
 const b64u = b => b.toString('base64url');
 const STATE_KEY = process.env.SESSION_SECRET || 'dev-state-key';
-app.get('/login', (req, res) => {
-  if (DEMO) { req.session.user = { id: 'demo-user', username: 'demo_user', name: 'デモユーザー' }; db.prepare('INSERT OR IGNORE INTO users VALUES(?,?,?)').run('demo-user','demo_user','デモユーザー'); return res.redirect('/'); }
+app.get('/login', async (req, res) => {
+  if (DEMO) { req.session.user = { id: 'demo-user', username: 'demo_user', name: 'デモユーザー' }; await db.prepare('INSERT INTO users(id,username,name) VALUES(?,?,?) ON CONFLICT DO NOTHING').run('demo-user','demo_user','デモユーザー'); return req.session.save(() => res.redirect('/')); }
   const verifier = b64u(crypto.randomBytes(32)), payload = verifier + '.' + Date.now();
   const state = payload + '.' + b64u(crypto.createHmac('sha256', STATE_KEY).update(payload).digest());
   const q = new URLSearchParams({ response_type: 'code', client_id: CID, redirect_uri: BASE + '/callback', scope: SCOPES, state,
@@ -71,19 +86,20 @@ app.get('/callback', async (req, res) => {
   if (CSEC) headers.Authorization = 'Basic ' + Buffer.from(`${CID}:${CSEC}`).toString('base64');
   const tr = await fetch('https://api.x.com/2/oauth2/token', { method: 'POST', headers, body: new URLSearchParams({ grant_type: 'authorization_code', code: req.query.code, redirect_uri: BASE + '/callback', code_verifier: req.session.verifier, client_id: CID }) });
   const tok = await tr.json().catch(()=>({})); if (!tok.access_token) { console.error('TOKEN_ERROR', tr.status, JSON.stringify({error:tok.error,error_description:tok.error_description,title:tok.title,detail:tok.detail}), 'redirect_uri=', BASE + '/callback', 'cid_prefix=', (CID||'').slice(0,6), 'has_secret=', !!CSEC); return res.status(400).send('token error: ' + (tok.error_description || tok.error || tok.detail || tr.status)); }
-  const me = (await (await fetch('https://api.x.com/2/users/me', { headers: { Authorization: 'Bearer ' + tok.access_token } })).json()).data;
-  db.prepare('INSERT OR REPLACE INTO users VALUES(?,?,?)').run(me.id, me.username, me.name);
-  req.session.user = me; req.session.token = tok.access_token; // token kept in server session only, never in DB/logs
-  res.redirect('/');
+  const me = (await (await fetch('https://api.x.com/2/users/me?user.fields=profile_image_url', { headers: { Authorization: 'Bearer ' + tok.access_token } })).json()).data;
+  await db.prepare('INSERT INTO users(id,username,name,avatar) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET username=EXCLUDED.username, name=EXCLUDED.name, avatar=EXCLUDED.avatar').run(me.id, me.username, me.name, me.profile_image_url || null);
+  req.session.user = me; req.session.token = tok.access_token; // token kept in server-side session only, never logged
+  req.session.save(() => res.redirect('/'));
 });
 app.get('/logout', (req, res) => req.session.destroy(() => res.redirect('/')));
 const auth = (req, res, next) => req.session.user ? next() : res.redirect('/login');
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
   const uid = req.session.user?.id;
-  const rows = db.prepare(`SELECT s.*, u.username owner, (SELECT 1 FROM reminders r WHERE r.space_row=s.id AND r.user_id=?) rem FROM spaces s LEFT JOIN users u ON u.id=s.owner_id WHERE start_at >= ? ORDER BY start_at`).all(uid ?? '', new Date(Date.now() - 3600e3).toISOString());
+  const rows = await db.prepare(`SELECT s.*, u.username owner, (SELECT 1 FROM reminders r WHERE r.space_row=s.id AND r.user_id=?) rem FROM spaces s LEFT JOIN users u ON u.id=s.owner_id WHERE start_at >= ? ORDER BY start_at`).all(uid ?? '', new Date(Date.now() - 3600e3).toISOString());
+  rows.forEach(s => s.start_at = new Date(s.start_at).toISOString());
   const card = s => { const r = rel(s.start_at), live = r === 'LIVE', soon = !live && (new Date(s.start_at) - Date.now()) < 864e5;
     const dt = new Date(s.start_at), jp = o => dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', ...o });
-    return `<article class="card"><div class="date"><div class="d">${jp({ month: 'numeric', day: 'numeric' })}<small>${jp({ weekday: 'short' })}</small></div><div class="h">${jp({ hour: '2-digit', minute: '2-digit' })}</div></div><div class="body"><div class="top"><div class="av">${esc((s.host || '?')[0].toUpperCase())}</div><div class="host">@${esc(s.host)}</div>
+    return `<article class="card"><div class="date"><div class="d">${jp({ month: 'numeric', day: 'numeric' })}<small>${jp({ weekday: 'short' })}</small></div><div class="h">${jp({ hour: '2-digit', minute: '2-digit' })}</div></div><div class="body"><div class="top"><div class="av">${esc((s.host || '?')[0].toUpperCase())}<img src="${esc(s.avatar || 'https://unavatar.io/x/' + encodeURIComponent(s.host || ''))}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()"></div><div class="host">@${esc(s.host)}</div>
 <div class="chips">${s.demo ? '<span class="chip s">サンプル</span>' : ''}<span class="chip ${live ? 'live' : soon ? 'soon' : ''}">${live ? '● LIVE' : soon ? '⏰ まもなく' : '📅 予定'}</span></div></div>
 <div class="title">${esc(s.title)}</div><div class="time"><span class="rel">${live ? '配信中' : r}</span><span>🕒 ${fmtShort(s.start_at)} JST</span></div></div>
 <div class="acts"><a class="btn pri" href="${esc(s.url)}" target="_blank" rel="noopener">▶ 開く</a><a class="btn" href="${gcal(s)}" target="_blank" rel="noopener">📅 Googleカレンダー</a><a class="btn" href="/spaces/${s.id}.ics">.ics</a>
@@ -97,11 +113,12 @@ const demoSpace = id => { const h = [...crypto.createHash('sha256').update(id).d
   const d = new Date(Date.now() + (1 + h[2] % 6) * 864e5); d.setUTCHours(11 + h[3] % 3, 0, 0, 0); // 20:00-22:00 JST
   return { id, title: `【デモ】${topics[h[0] % topics.length]}`, scheduled_start: d.toISOString(), host: hosts[h[1] % hosts.length], state: 'scheduled', demo: true }; };
 async function lookupSpace(id, token) {
-  const r = await fetch(`https://api.x.com/2/spaces/${encodeURIComponent(id)}?space.fields=title,scheduled_start,started_at,creator_id,state&expansions=creator_id&user.fields=username`, { headers: { Authorization: 'Bearer ' + token } });
+  const r = await fetch(`https://api.x.com/2/spaces/${encodeURIComponent(id)}?space.fields=title,scheduled_start,started_at,creator_id,state&expansions=creator_id&user.fields=username,profile_image_url`, { headers: { Authorization: 'Bearer ' + token } });
   const j = await r.json().catch(() => ({})); if (!r.ok || !j.data) throw new Error('lookup status ' + r.status);
-  let host = j.includes?.users?.find(u => u.id === j.data.creator_id)?.username;
+  const cu = j.includes?.users?.find(u => u.id === j.data.creator_id); let host = cu?.username, avatar = cu?.profile_image_url;
   if (!host && j.data.creator_id) { const u = await (await fetch(`https://api.x.com/2/users/${j.data.creator_id}`, { headers: { Authorization: 'Bearer ' + token } })).json().catch(() => ({})); host = u.data?.username; }
-  return { id, title: j.data.title || '', scheduled_start: j.data.scheduled_start || j.data.started_at || null, host: host || '', state: j.data.state };
+  if (host && !avatar) try { avatar = (await (await fetch(`https://api.x.com/2/users/by/username/${encodeURIComponent(host)}?user.fields=profile_image_url`, { headers: { Authorization: 'Bearer ' + token } })).json()).data?.profile_image_url; } catch {}
+  return { id, title: j.data.title || '', scheduled_start: j.data.scheduled_start || j.data.started_at || null, host: host || '', avatar: avatar || null, state: j.data.state };
 }
 app.get('/api/space', auth, async (req, res) => {
   const id = spaceIdOf(req.query.url); if (!id) return res.status(400).json({ error: 'スペースIDが見つかりません。URLを確認してください。' });
@@ -131,28 +148,30 @@ u.addEventListener('change',load);u.addEventListener('blur',load);u.addEventList
 f.addEventListener('submit',function(e){if(u.value.trim()!==last){e.preventDefault();load().then(function(){f.submit()})}});})()</script>`)));
 app.post('/new', auth, async (req, res) => {
   const id = spaceIdOf(req.body.url); if (!id) return res.status(400).send(page(req, '<div class="msg">スペースIDが見つかりませんでした。URLを確認してください。 <a class="btn" href="/new">戻る</a></div>'));
-  let { title, host, start } = req.body; let startIso = start ? new Date(start + '+09:00').toISOString() : null;
+  let { title, host, start } = req.body, avatar = null; let startIso = start ? new Date(start + '+09:00').toISOString() : null;
   if (!title || !startIso) try { const sp = DEMO ? demoSpace(id) : req.session.token ? await lookupSpace(id, req.session.token) : null;
-    if (sp) { title = title || sp.title; startIso = startIso || sp.scheduled_start; host = host || sp.host; } } catch (e) { console.warn('space lookup failed'); }
+    if (sp) { title = title || sp.title; startIso = startIso || sp.scheduled_start; host = host || sp.host; avatar = sp.avatar || null; } } catch (e) { console.warn('space lookup failed'); }
+  if (!avatar && !DEMO && req.session.token && (host || req.session.user.username)) try { const r = await fetch(`https://api.x.com/2/users/by/username/${encodeURIComponent(host || req.session.user.username)}?user.fields=profile_image_url`, { headers: { Authorization: 'Bearer ' + req.session.token } }); avatar = (await r.json()).data?.profile_image_url || null; } catch {}
   if (!title || !startIso) return res.status(400).send(page(req, '<div class="msg">タイトルと開始日時を取得できませんでした。「編集」から手入力してください。 <a class="btn" href="/new">戻る</a></div>'));
-  db.prepare('INSERT INTO spaces(space_id,url,title,host,start_at,owner_id) VALUES(?,?,?,?,?,?)').run(id, `https://x.com/i/spaces/${id}`, title, host || req.session.user.username, startIso, req.session.user.id);
+  await db.prepare('INSERT INTO spaces(space_id,url,title,host,avatar,start_at,owner_id) VALUES(?,?,?,?,?,?,?)').run(id, `https://x.com/i/spaces/${id}`, title, (host || req.session.user.username).replace(/^@/, ''), avatar, startIso, req.session.user.id);
   res.redirect('/');
 });
-app.post('/spaces/:id/remind', auth, (req, res) => {
+app.post('/spaces/:id/remind', auth, async (req, res) => {
   const u = req.session.user.id, id = +req.params.id;
-  if (db.prepare('SELECT 1 FROM reminders WHERE user_id=? AND space_row=?').get(u, id)) db.prepare('DELETE FROM reminders WHERE user_id=? AND space_row=?').run(u, id);
-  else db.prepare('INSERT INTO reminders(user_id,space_row) VALUES(?,?)').run(u, id);
+  if (await db.prepare('SELECT 1 FROM reminders WHERE user_id=? AND space_row=?').get(u, id)) await db.prepare('DELETE FROM reminders WHERE user_id=? AND space_row=?').run(u, id);
+  else await db.prepare('INSERT INTO reminders(user_id,space_row) VALUES(?,?)').run(u, id);
   res.redirect('/');
 });
-app.get('/spaces/:id.ics', (req, res) => {
-  const s = db.prepare('SELECT * FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.sendStatus(404);
+app.get('/spaces/:id.ics', async (req, res) => {
+  const s = await db.prepare('SELECT * FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.sendStatus(404);
   const d = x => new Date(x).toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
   res.type('text/calendar').attachment(`space-${s.id}.ics`).send(['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//SpacesBoard//JA','BEGIN:VEVENT',`UID:space-${s.id}@spaces-board`,`DTSTAMP:${d(Date.now())}`,`DTSTART:${d(s.start_at)}`,`DTEND:${d(new Date(s.start_at).getTime()+3600e3)}`,`SUMMARY:${s.title.replace(/[,;\n]/g,' ')}`,`URL:${s.url}`,`DESCRIPTION:${s.url}`,'BEGIN:VALARM','TRIGGER:-PT15M','ACTION:DISPLAY','DESCRIPTION:スペース開始15分前','END:VALARM','END:VEVENT','END:VCALENDAR'].join('\r\n'));
 });
 app.get('/healthz', (req, res) => res.json({ ok: true, demo: DEMO }));
 // Reminder job stub: every minute, find due reminders. Delivery channel (email / web push / DM via dm.write) TBD.
-setInterval(() => {
-  const due = db.prepare(`SELECT r.user_id, r.space_row, s.title, s.start_at, u.username FROM reminders r JOIN spaces s ON s.id=r.space_row JOIN users u ON u.id=r.user_id WHERE r.sent=0 AND datetime(s.start_at, '-' || r.minutes_before || ' minutes') <= datetime('now')`).all();
-  for (const r of due) { console.log(`[reminder stub] @${r.username}: 「${r.title}」 ${fmt(r.start_at)}`); db.prepare('UPDATE reminders SET sent=1 WHERE user_id=? AND space_row=?').run(r.user_id, r.space_row); }
+setInterval(async () => { try {
+  const due = await db.prepare(`SELECT r.user_id, r.space_row, s.title, s.start_at, u.username FROM reminders r JOIN spaces s ON s.id=r.space_row JOIN users u ON u.id=r.user_id WHERE r.sent=0 AND s.start_at - make_interval(mins => r.minutes_before) <= now()`).all();
+  for (const r of due) { console.log(`[reminder stub] @${r.username}: 「${r.title}」 ${fmt(r.start_at)}`); await db.prepare('UPDATE reminders SET sent=1 WHERE user_id=? AND space_row=?').run(r.user_id, r.space_row); }
+  await pool.query('DELETE FROM sessions WHERE expire<now()'); } catch (e) { console.error('reminder job', e.message); }
 }, 60e3);
 app.listen(PORT, () => console.log(`Spaces Board on ${BASE} (demo=${DEMO})`));
