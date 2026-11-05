@@ -63,7 +63,7 @@ app.get('/callback', async (req, res) => {
   const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
   if (CSEC) headers.Authorization = 'Basic ' + Buffer.from(`${CID}:${CSEC}`).toString('base64');
   const tr = await fetch('https://api.x.com/2/oauth2/token', { method: 'POST', headers, body: new URLSearchParams({ grant_type: 'authorization_code', code: req.query.code, redirect_uri: BASE + '/callback', code_verifier: req.session.verifier, client_id: CID }) });
-  const tok = await tr.json(); if (!tok.access_token) return res.status(400).send('token error');
+  const tok = await tr.json().catch(()=>({})); if (!tok.access_token) { console.error('TOKEN_ERROR', tr.status, JSON.stringify({error:tok.error,error_description:tok.error_description,title:tok.title,detail:tok.detail}), 'redirect_uri=', BASE + '/callback', 'cid_prefix=', (CID||'').slice(0,6), 'has_secret=', !!CSEC); return res.status(400).send('token error: ' + (tok.error_description || tok.error || tok.detail || tr.status)); }
   const me = (await (await fetch('https://api.x.com/2/users/me', { headers: { Authorization: 'Bearer ' + tok.access_token } })).json()).data;
   db.prepare('INSERT OR REPLACE INTO users VALUES(?,?,?)').run(me.id, me.username, me.name);
   req.session.user = me; req.session.token = tok.access_token; // token kept in server session only, never in DB/logs
