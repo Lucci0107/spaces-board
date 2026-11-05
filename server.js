@@ -29,8 +29,13 @@ CREATE TABLE IF NOT EXISTS reminders(user_id TEXT, space_row INTEGER, minutes_be
 CREATE TABLE IF NOT EXISTS sessions(sid TEXT PRIMARY KEY, sess JSONB NOT NULL, expire TIMESTAMPTZ NOT NULL);`);
   if (DEMO && !(await db.prepare('SELECT 1 FROM spaces WHERE demo=1').get())) {
     const ins = db.prepare('INSERT INTO spaces(space_id,url,title,host,start_at,owner_id,demo,has_recording,recording_url,space_state,ended_at) VALUES(?,?,?,?,?,?,1,?,?,?,?)');
-    for (const [[h,t,u],i] of [[2,'【サンプル】共創ナビ雑談スペース','NiziUcci'],[26,'【サンプル】X API もくもく会','demo_host'],[50,'【サンプル】週末AIトーク','demo_user']].map((x,i)=>[x,i]))
-      await ins.run('1demo'+i,'https://x.com/i/spaces/1demo'+i,t,u,new Date(Date.now()+h*3600e3).toISOString(),'demo',0,null,'scheduled',null);
+    // First upcoming sample is always "today" in JST (evening if morning, +90m if late); others stay later.
+    const todayEve = (() => { const n = new Date(); const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', hour12:false }).formatToParts(n).reduce((a,p)=> (a[p.type]=p.value, a), {});
+      let h = 20, m = 0; const curH = +parts.hour, curM = +parts.minute; if (curH > 20 || (curH === 20 && curM >= 0)) { h = Math.min(23, curH + 1); m = (curM + 30) % 60; if (curH >= 23) { /* keep +90m from now as fallback */ return new Date(Date.now() + 90*60e3); } }
+      return new Date(`${parts.year}-${parts.month}-${parts.day}T${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:00+09:00`); })();
+    const upcomingDemos = [[todayEve,'【サンプル】本日の共創ナビ雑談','NiziUcci'],[new Date(Date.now()+26*3600e3),'【サンプル】X API もくもく会','demo_host'],[new Date(Date.now()+50*3600e3),'【サンプル】週末AIトーク','demo_user']];
+    for (const [[start,t,u],i] of upcomingDemos.map((x,i)=>[x,i]))
+      await ins.run('1demo'+i,'https://x.com/i/spaces/1demo'+i,t,u,start.toISOString(),'demo',0,null,'scheduled',null);
     // Past archives with recording (demo)
     const past = [[30,'【サンプル】先週の朝活アーカイブ','NiziUcci'],[80,'【サンプル】クリエイター交流アーカイブ','demo_host'],[200,'【サンプル】AIトーク振り返り','demo_user']];
     for (const [[h,t,u],i] of past.map((x,i)=>[x,i])) {
@@ -78,8 +83,8 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};
 const fmt = iso => new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) + ' (JST)';
 const fmtShort = iso => new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', weekday: 'short', hour: '2-digit', minute: '2-digit' });
 const rel = iso => { const m = Math.round((new Date(iso) - Date.now()) / 60e3); if (m <= 0 && m > -60) return 'LIVE'; if (m < 60) return `あと${m}分`; if (m < 1440) return `あと${Math.round(m/60)}時間`; return `あと${Math.round(m/1440)}日`; };
-const CSS = `.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}:root,[data-theme=dark]{color-scheme:dark;--bg:#0a0a10;--card:#13131c;--line:#262634;--tx:#f1f1f6;--mut:#9b9bb0;--pu:#8b5cf6;--bl:#3b82f6;--pk:#ec4899;--glow:rgba(139,92,246,.16);--btn:#171722;--btnh:#1f1a30;--onbg:#2a1830;--ontx:#f5c2e7;--ntx:#d4ccf5;--sh:rgba(0,0,0,.35);--chbg:rgba(139,92,246,.12);--chbd:#6d4fd8;--chtx:#c4b5fd;--lvbg:#3b0d1d;--lvbd:#be185d;--lvtx:#fda4af;--sbg:#221b08;--sbd:#5c4a14;--stx:#fcd34d;--time:#a9a9be;--inp:#0e0e16;--ft:#5c5c75;--xbg:#ffffff;--xtx:#0a0a10;--seg:#14141d;--segon:#2a2a38;--segtx:#f1f1f6;--logo:#a78bfa}
-[data-theme=light]{color-scheme:light;--bg:#f7f7fb;--card:#ffffff;--line:#e6e5ef;--tx:#14132a;--mut:#5f5d78;--pu:#7c3aed;--bl:#3b82f6;--pk:#db2777;--glow:rgba(124,58,237,.07);--btn:#ffffff;--btnh:#f5f1ff;--onbg:#fde7f3;--ontx:#9d174d;--ntx:#4c1d95;--sh:rgba(40,30,90,.07);--chbg:#f1ecff;--chbd:#e2d8fe;--chtx:#6d28d9;--lvbg:#ffe4ec;--lvbd:#f9a8c4;--lvtx:#be123c;--sbg:#fef6dc;--sbd:#f3d77a;--stx:#92600a;--time:#4b4a63;--inp:#f9f8fd;--ft:#8a88a3;--xbg:#0a0a10;--xtx:#ffffff;--seg:#ecebf3;--segon:#ffffff;--segtx:#14132a;--logo:#7c3aed}
+const CSS = `.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}:root,[data-theme=dark]{color-scheme:dark;--bg:#0a0a10;--card:#13131c;--line:#262634;--tx:#f1f1f6;--mut:#9b9bb0;--pu:#8b5cf6;--bl:#3b82f6;--pk:#ec4899;--glow:rgba(139,92,246,.16);--btn:#171722;--btnh:#1f1a30;--onbg:#2a1830;--ontx:#f5c2e7;--ntx:#d4ccf5;--sh:rgba(0,0,0,.35);--chbg:rgba(139,92,246,.12);--chbd:#6d4fd8;--chtx:#c4b5fd;--lvbg:#3b0d1d;--lvbd:#be185d;--lvtx:#fda4af;--sbg:#221b08;--sbd:#5c4a14;--stx:#fcd34d;--time:#a9a9be;--inp:#0e0e16;--ft:#5c5c75;--xbg:#ffffff;--xtx:#0a0a10;--seg:#14141d;--segon:#2a2a38;--segtx:#f1f1f6;--logo:#a78bfa;--tdbg:rgba(251,146,60,.12);--tdbd:#f59e0b;--tdtx:#fbbf24;--tdcard:#1a140c;--tdglow:rgba(245,158,11,.22)}
+[data-theme=light]{color-scheme:light;--bg:#f7f7fb;--card:#ffffff;--line:#e6e5ef;--tx:#14132a;--mut:#5f5d78;--pu:#7c3aed;--bl:#3b82f6;--pk:#db2777;--glow:rgba(124,58,237,.07);--btn:#ffffff;--btnh:#f5f1ff;--onbg:#fde7f3;--ontx:#9d174d;--ntx:#4c1d95;--sh:rgba(40,30,90,.07);--chbg:#f1ecff;--chbd:#e2d8fe;--chtx:#6d28d9;--lvbg:#ffe4ec;--lvbd:#f9a8c4;--lvtx:#be123c;--sbg:#fef6dc;--sbd:#f3d77a;--stx:#92600a;--time:#4b4a63;--inp:#f9f8fd;--ft:#8a88a3;--xbg:#0a0a10;--xtx:#ffffff;--seg:#ecebf3;--segon:#ffffff;--segtx:#14132a;--logo:#7c3aed;--tdbg:#fff7ed;--tdbd:#f59e0b;--tdtx:#b45309;--tdcard:#fffbf5;--tdglow:rgba(245,158,11,.18)}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 500px at 15% -10%,var(--glow) 0,transparent 60%),var(--bg);color:var(--tx);font-family:Inter,"Hiragino Sans","Noto Sans JP","Yu Gothic UI",system-ui,sans-serif;line-height:1.6;min-height:100vh;-webkit-font-smoothing:antialiased}
 a{color:inherit;text-decoration:none}.wrap{max-width:1080px;margin:auto;padding:22px 20px 60px}
 nav{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.15rem}.logo i{font-style:normal;width:40px;height:40px;display:grid;place-items:center;border-radius:12px;background:var(--card);border:1px solid var(--line);box-shadow:0 2px 8px var(--sh);font-size:1.1rem}.logo span b{color:var(--logo)}
@@ -91,7 +96,7 @@ nav{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-
 .notice{display:flex;gap:10px;align-items:flex-start;background:var(--chbg);border:1px solid var(--chbd);color:var(--ntx);padding:10px 14px;border-radius:14px;font-size:.85rem;margin-top:18px}
 h2{font-size:1rem;color:var(--mut);font-weight:600;margin:26px 0 14px}h2 b{color:var(--tx)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:18px}
-.card{display:grid;grid-template-columns:96px 1fr;gap:6px 18px;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 6px 24px var(--sh);transition:.2s}.card:hover{border-color:var(--chbd);transform:translateY(-2px)}
+.card{display:grid;grid-template-columns:96px 1fr;gap:6px 18px;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 6px 24px var(--sh);transition:.2s}.card:hover{border-color:var(--chbd);transform:translateY(-2px)}.card.today{background:var(--tdcard);border-color:var(--tdbd);box-shadow:0 6px 24px var(--sh),0 0 0 1px var(--tdbd),0 8px 28px var(--tdglow)}.card.today:hover{border-color:var(--tdbd);filter:brightness(1.02)}.card.today .date{background:linear-gradient(160deg,#f59e0b,#ea580c)!important;box-shadow:0 6px 16px rgba(234,88,12,.35)}.chip.today{background:var(--tdbg);border-color:var(--tdbd);color:var(--tdtx)}
 .date{width:96px;height:100px;border-radius:14px;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;background:linear-gradient(160deg,#a855f7,#6366f1);box-shadow:0 6px 16px rgba(124,58,237,.25);line-height:1.15}.card:nth-child(2n) .date{background:linear-gradient(160deg,#60a5fa,#4f46e5)}.date .d{font-size:1.5rem;font-weight:800}.date .d small{font-size:.9rem;margin-left:2px}.date .h{font-size:1.15rem;font-weight:600;margin-top:6px}
 .body{min-width:0}.top{display:flex;gap:10px;align-items:center}.av{position:relative;overflow:hidden;flex:none;width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font-weight:800;color:#fff;background:linear-gradient(135deg,var(--pu),var(--pk));border:2px solid var(--card);box-shadow:0 0 0 1px var(--line)}
 .host{font-size:.9rem;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chips{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
@@ -156,6 +161,9 @@ const isPast = s => {
   if (s.space_state === 'live' || s.space_state === 'scheduled') return false;
   return new Date(s.start_at).getTime() < Date.now() - CUTOFF_MS;
 };
+// Calendar date in Asia/Tokyo (YYYY-MM-DD), independent of server/browser local TZ.
+const jstYmd = iso => new Date(iso).toLocaleDateString('en-CA', { timeZone: 'Asia/Tokyo' });
+const isTodayJst = iso => jstYmd(iso) === jstYmd(Date.now());
 app.get('/', async (req, res) => {
   const uid = req.session.user?.id;
   const tab = req.query.tab === 'archive' ? 'archive' : 'upcoming';
@@ -166,12 +174,15 @@ app.get('/', async (req, res) => {
   const rows = tab === 'archive' ? archive : upcoming;
   rows.forEach(s => { s.start_at = new Date(s.start_at).toISOString(); if (s.ended_at) s.ended_at = new Date(s.ended_at).toISOString(); });
   const card = s => { const past = tab === 'archive' || isPast(s); const r = rel(s.start_at), live = !past && r === 'LIVE', soon = !past && !live && (new Date(s.start_at) - Date.now()) < 864e5;
+    const today = !past && isTodayJst(s.start_at);
     const dt = new Date(s.start_at), jp = o => dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', ...o });
     const openUrl = (past && s.recording_url) ? s.recording_url : s.url;
-    const chip = past ? `<span class="chip arc">🎙 アーカイブ</span>` : `<span class="chip ${live ? 'live' : soon ? 'soon' : ''}">${live ? '● LIVE' : soon ? '⏰ まもなく' : '📅 予定'}</span>`;
+    // LIVE chip stays for live spaces; 「本日」 is an extra badge for JST calendar-today.
+    const statusChip = past ? `<span class="chip arc">🎙 アーカイブ</span>` : `<span class="chip ${live ? 'live' : soon ? 'soon' : ''}">${live ? '● LIVE' : soon ? '⏰ まもなく' : '📅 予定'}</span>`;
+    const todayChip = today ? '<span class="chip today">🔥 本日</span>' : '';
     const own = uid && (s.owner_id === uid || req.isAdmin);
-    return `<article class="card"><div class="date"><div class="d">${jp({ month: 'numeric', day: 'numeric' })}<small>${jp({ weekday: 'short' })}</small></div><div class="h">${jp({ hour: '2-digit', minute: '2-digit' })}</div></div><div class="body"><div class="top"><div class="av">${esc((s.host || '?')[0].toUpperCase())}<img src="${esc(s.avatar || 'https://unavatar.io/x/' + encodeURIComponent(s.host || ''))}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()"></div><div class="host">@${esc(s.host)}</div>
-<div class="chips">${s.demo ? '<span class="chip s">サンプル</span>' : ''}${+s.has_recording && !past ? '<span class="chip arc">🎙 録音予定</span>' : ''}${chip}</div></div>
+    return `<article class="card${today ? ' today' : ''}"${today ? ' data-today="1"' : ''}><div class="date"><div class="d">${jp({ month: 'numeric', day: 'numeric' })}<small>${jp({ weekday: 'short' })}</small></div><div class="h">${jp({ hour: '2-digit', minute: '2-digit' })}</div></div><div class="body"><div class="top"><div class="av">${esc((s.host || '?')[0].toUpperCase())}<img src="${esc(s.avatar || 'https://unavatar.io/x/' + encodeURIComponent(s.host || ''))}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()"></div><div class="host">@${esc(s.host)}</div>
+<div class="chips">${s.demo ? '<span class="chip s">サンプル</span>' : ''}${todayChip}${+s.has_recording && !past ? '<span class="chip arc">🎙 録音予定</span>' : ''}${statusChip}</div></div>
 <div class="title">${esc(s.title)}</div><div class="time"><span class="rel">${past ? '終了' : live ? '配信中' : r}</span><span>🕒 ${fmtShort(s.start_at)} JST</span></div></div>
 <div class="acts"><a class="btn pri" href="${esc(openUrl)}" target="_blank" rel="noopener">${past ? '▶ 録音を聴く' : '▶ 開く'}</a>${past ? '' : `<a class="btn" href="${gcal(s)}" target="_blank" rel="noopener">📅 Googleカレンダー</a><a class="btn" href="/spaces/${s.id}.ics">.ics</a>`}
 ${uid ? `${own ? `<a class="btn" href="/spaces/${s.id}/edit">✏️ 編集</a><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('このスペースを削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="${tab}"><button class="btn">🗑 削除</button></form>` : ''}${past ? '' : `<form method="post" action="/spaces/${s.id}/remind"><input type="hidden" name="back" value="${tab}"><button class="btn ${s.rem ? 'on' : ''}">${s.rem ? '🔔 リマインダー中' : '🔕 リマインダー'}</button></form>`}` : (past ? '' : '<a class="btn" href="/login">🔕 リマインダー</a>')}</div></article>`; };
