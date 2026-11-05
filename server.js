@@ -49,6 +49,7 @@ const page = (req, body, hero = false) => `<!doctype html><html lang="ja" data-t
 ${hero ? `<section class="hero"><h1>スペースの予定を、<br><em>みんなで共有。</em></h1><p>Xスペースの開催予定を登録して一覧で見られる掲示板。気になる回はリマインダーやカレンダーに追加して、聞き逃しを防ごう。</p></section>` : ''}
 ${DEMO ? '<div class="notice">✨ <div><b>デモモード</b>：Xのキー未設定のため、疑似ユーザーでログインし、サンプルデータを表示しています。</div></div>' : ''}
 ${body}<footer>Spaces Board · 時刻はすべて日本時間 (JST)</footer></div></body></html>`;
+const gcal = s => { const f = t => new Date(t).toISOString().replace(/[-:]/g,'').replace(/\.\d{3}/,''); return 'https://calendar.google.com/calendar/render?' + new URLSearchParams({ action: 'TEMPLATE', text: s.title, dates: f(s.start_at) + '/' + f(new Date(s.start_at).getTime() + 3600e3), details: s.url, location: s.url }); };
 const b64u = b => b.toString('base64url');
 const STATE_KEY = process.env.SESSION_SECRET || 'dev-state-key';
 app.get('/login', (req, res) => {
@@ -82,7 +83,7 @@ app.get('/', (req, res) => {
     return `<article class="card"><div class="top"><div class="av">${esc((s.host || '?')[0].toUpperCase())}</div><div><div class="host">@${esc(s.host)}</div></div>
 <div class="chips">${s.demo ? '<span class="chip s">サンプル</span>' : ''}<span class="chip ${live ? 'live' : soon ? 'soon' : ''}">${live ? '● LIVE' : soon ? '⏰ まもなく' : '📅 予定'}</span></div></div>
 <div class="title">${esc(s.title)}</div><div class="time"><span class="rel">${live ? '配信中' : r}</span><span>${fmtShort(s.start_at)} JST</span></div>
-<div class="acts"><a class="btn pri" href="${esc(s.url)}" target="_blank" rel="noopener">▶ 開く</a><a class="btn" href="/spaces/${s.id}.ics">📅 .ics</a>
+<div class="acts"><a class="btn pri" href="${esc(s.url)}" target="_blank" rel="noopener">▶ 開く</a><a class="btn" href="${gcal(s)}" target="_blank" rel="noopener">📅 Googleカレンダー</a><a class="btn" href="/spaces/${s.id}.ics">.ics</a>
 ${uid ? `<form method="post" action="/spaces/${s.id}/remind"><button class="btn ${s.rem ? 'on' : ''}">${s.rem ? '🔔 リマインダー中' : '🔕 リマインダー'}</button></form>` : '<a class="btn" href="/login">🔕 リマインダー</a>'}</div></article>`; };
   res.send(page(req, `<h2>これからのスペース <b>${rows.length}</b> 件</h2>` + (rows.length ? rows.map(card).join('') : '<div class="empty">まだ予定がありません。最初のスペースを登録しよう！</div>'), true));
 });
