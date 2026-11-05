@@ -50,16 +50,20 @@ ${hero ? `<section class="hero"><h1>スペースの予定を、<br><em>みんな
 ${DEMO ? '<div class="notice">✨ <div><b>デモモード</b>：Xのキー未設定のため、疑似ユーザーでログインし、サンプルデータを表示しています。</div></div>' : ''}
 ${body}<footer>Spaces Board · 時刻はすべて日本時間 (JST)</footer></div></body></html>`;
 const b64u = b => b.toString('base64url');
+const STATE_KEY = process.env.SESSION_SECRET || 'dev-state-key';
 app.get('/login', (req, res) => {
   if (DEMO) { req.session.user = { id: 'demo-user', username: 'demo_user', name: 'デモユーザー' }; db.prepare('INSERT OR IGNORE INTO users VALUES(?,?,?)').run('demo-user','demo_user','デモユーザー'); return res.redirect('/'); }
-  const verifier = b64u(crypto.randomBytes(32)), state = b64u(crypto.randomBytes(16));
-  Object.assign(req.session, { verifier, state });
+  const verifier = b64u(crypto.randomBytes(32)), payload = verifier + '.' + Date.now();
+  const state = payload + '.' + b64u(crypto.createHmac('sha256', STATE_KEY).update(payload).digest());
   const q = new URLSearchParams({ response_type: 'code', client_id: CID, redirect_uri: BASE + '/callback', scope: SCOPES, state,
     code_challenge: b64u(crypto.createHash('sha256').update(verifier).digest()), code_challenge_method: 'S256' });
   res.redirect('https://x.com/i/oauth2/authorize?' + q);
 });
 app.get('/callback', async (req, res) => {
-  if (!req.query.code || req.query.state !== req.session.state) return res.status(400).send('state mismatch');
+  const [v, ts, sig] = String(req.query.state || '').split('.');
+  const ok = v && ts && sig === b64u(crypto.createHmac('sha256', STATE_KEY).update(v + '.' + ts).digest()) && Date.now() - +ts < 15 * 60 * 1000;
+  if (!req.query.code || !ok) { console.error('STATE_ERROR', req.query.error || '', !!req.query.code); return res.status(400).send('ログインをやり直してください（state error）。<a href="/login">もう一度ログイン</a>'); }
+  req.session.verifier = v;
   const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
   if (CSEC) headers.Authorization = 'Basic ' + Buffer.from(`${CID}:${CSEC}`).toString('base64');
   const tr = await fetch('https://api.x.com/2/oauth2/token', { method: 'POST', headers, body: new URLSearchParams({ grant_type: 'authorization_code', code: req.query.code, redirect_uri: BASE + '/callback', code_verifier: req.session.verifier, client_id: CID }) });
