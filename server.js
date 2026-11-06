@@ -218,8 +218,8 @@ app.get('/', async (req, res) => {
   const hostSql = hostFilter ? ' AND LOWER(s.host)=LOWER(?)' : '';
   const upArgs = hostFilter ? [cutoff, hostFilter] : [cutoff];
   const arArgs = hostFilter ? [cutoff, hostFilter] : [cutoff];
-  const upcoming = await db.prepare(`${base} WHERE start_at >= ? AND COALESCE(space_state,'') <> 'ended'${hostSql} ORDER BY start_at`).all(...upArgs);
-  const archive = await db.prepare(`${base} WHERE has_recording=1 AND (ended_at IS NOT NULL OR space_state='ended' OR start_at < ?)${hostSql} ORDER BY COALESCE(ended_at, start_at) DESC`).all(...arArgs);
+  const upcoming = await db.prepare(`${base} WHERE (start_at >= ? OR space_state='live') AND COALESCE(space_state,'') NOT IN ('ended','canceled') AND ended_at IS NULL${hostSql} ORDER BY start_at`).all(...upArgs);
+  const archive = await db.prepare(`${base} WHERE has_recording=1 AND COALESCE(space_state,'') <> 'live' AND (ended_at IS NOT NULL OR space_state='ended' OR start_at < ?)${hostSql} ORDER BY COALESCE(ended_at, start_at) DESC`).all(...arArgs);
   upcoming.forEach(s => { s.start_at = new Date(s.start_at).toISOString(); if (s.ended_at) s.ended_at = new Date(s.ended_at).toISOString(); });
   archive.forEach(s => { s.start_at = new Date(s.start_at).toISOString(); if (s.ended_at) s.ended_at = new Date(s.ended_at).toISOString(); });
   if (tab !== 'archive') await refreshDueSpaceStates(upcoming, 3, req);
@@ -453,15 +453,13 @@ function titlesMatch(a, b) {
 function pickTwinByState(candidates, ourTitle, ourStart, want) {
   const pool = (candidates || []).filter(c => normalizeSpaceState(c.state) === want && c.id);
   if (!pool.length) return null;
-  const exact = pool.find(c => titlesMatch(c.title, ourTitle));
-  if (exact) return exact;
-  if (pool.length === 1) {
-    const ours = new Date(ourStart).getTime();
-    const theirs = new Date(pool[0].started_at || pool[0].scheduled_start || 0).getTime();
-    if (ours && theirs && Math.abs(theirs - ours) <= 4 * 3600e3) return pool[0];
-    // Title exact already failed; still accept sole candidate when our start is past and want=ended/live.
-    if (ours && ours <= Date.now() + 30 * 60e3) return pool[0];
-  }
+  // Daily hosts reuse near-identical titles: only accept twins that started within [start-1h, start+4h].
+  const ours = new Date(ourStart).getTime();
+  const inWindow = c => { const t = new Date(c.started_at || c.scheduled_start || 0).getTime(); return ours && t && t >= ours - 3600e3 && t <= ours + 4 * 3600e3; };
+  const timed = pool.filter(inWindow);
+  const exactT = timed.find(c => titlesMatch(c.title, ourTitle));
+  if (exactT) return exactT;
+  if (timed.length === 1 && want === 'live') return timed[0];
   return null;
 }
 function pickLiveTwin(candidates, ourTitle, ourStart) {
@@ -596,6 +594,7 @@ async function refreshSpaceStateRow(row, req) {
         const twin = await lookupSpaceFromPublicPage(String(row.live_space_id));
         const tst = normalizeSpaceState(twin.state);
         if (tst === 'live') {
+          await db.prepare('UPDATE spaces SET ended_at=NULL WHERE id=?').run(row.id); row.ended_at = null;
           await persistSpaceState(row, { space_state: 'live', live_space_id: row.live_space_id });
           return row;
         }
@@ -619,6 +618,7 @@ async function refreshSpaceStateRow(row, req) {
       const sp = await lookupSpaceState(id, req);
       st = normalizeSpaceState(sp.state);
       if (st === 'live') {
+        await db.prepare('UPDATE spaces SET ended_at=NULL WHERE id=?').run(row.id); row.ended_at = null;
         await persistSpaceState(row, { space_state: 'live', live_space_id: null });
         return row;
       }
@@ -640,6 +640,7 @@ async function refreshSpaceStateRow(row, req) {
     if (near && st !== 'live' && (row.space_state !== 'live' || !row.live_space_id)) {
       const { live: liveTwin, ended: endedTwin } = await resolveLiveTwin(row, req);
       if (liveTwin && liveTwin.id) {
+        await db.prepare('UPDATE spaces SET ended_at=NULL WHERE id=?').run(row.id); row.ended_at = null;
         await persistSpaceState(row, { space_state: 'live', live_space_id: liveTwin.id });
       } else if (endedTwin && endedTwin.id && t0 <= now) {
         let recPatch = {};
@@ -665,7 +666,7 @@ async function refreshDueSpaceStates(rows, limit = 3, req) {
   const due = rows.filter(s => !s.demo && s.space_id && (() => {
     const t = new Date(s.start_at).getTime();
     // Near/past start: 3h after scheduled start through 30m before.
-    if (!(t >= now - 3 * 3600e3 && t <= now + 30 * 60e3)) return false;
+    if (s.space_state !== 'live' && !(t >= now - 3 * 3600e3 && t <= now + 30 * 60e3)) return false;
     if (s.space_state === 'ended' || s.space_state === 'canceled') {
       return !s.live_space_id || !s.recording_url;
     }
@@ -839,10 +840,10 @@ app.get('/healthz', (req, res) => res.json({ ok: true, demo: DEMO }));
 setInterval(async () => { try {
   await pool.query('DELETE FROM sessions WHERE expire<now()');
   await pool.query(`UPDATE spaces SET space_state='ended', ended_at=COALESCE(ended_at, start_at + interval '1 hour')
-    WHERE COALESCE(space_state,'') NOT IN ('ended','canceled') AND start_at < now() - interval '3 hours'`);
+    WHERE COALESCE(space_state,'') NOT IN ('ended','canceled','live') AND start_at < now() - interval '3 hours'`);
   const due = await db.prepare(`SELECT id, space_id, live_space_id, demo, space_state, start_at, title, host, ended_at, has_recording, recording_url FROM spaces
     WHERE COALESCE(demo,0)=0
-      AND start_at >= now() - interval '3 hours' AND start_at <= now() + interval '30 minutes'
+      AND ((start_at >= now() - interval '3 hours' AND start_at <= now() + interval '30 minutes') OR space_state='live')
       AND (
         COALESCE(space_state,'') NOT IN ('ended','canceled')
         OR live_space_id IS NULL
