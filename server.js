@@ -99,7 +99,7 @@ h2{font-size:1rem;color:var(--mut);font-weight:600;margin:26px 0 14px}h2 b{color
 .card{display:grid;grid-template-columns:96px 1fr;gap:6px 18px;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 6px 24px var(--sh);transition:.2s}.card:hover{border-color:var(--chbd);transform:translateY(-2px)}.card.today{background:var(--tdcard);border-color:var(--tdbd);box-shadow:0 6px 24px var(--sh),0 0 0 1px var(--tdbd),0 8px 28px var(--tdglow)}.card.today:hover{border-color:var(--tdbd);filter:brightness(1.02)}.card.today .date{background:linear-gradient(160deg,#f59e0b,#ea580c)!important;box-shadow:0 6px 16px rgba(234,88,12,.35)}.chip.today{background:var(--tdbg);border-color:var(--tdbd);color:var(--tdtx)}
 .date{width:96px;height:100px;border-radius:14px;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;background:linear-gradient(160deg,#a855f7,#6366f1);box-shadow:0 6px 16px rgba(124,58,237,.25);line-height:1.15}.card:nth-child(2n) .date{background:linear-gradient(160deg,#60a5fa,#4f46e5)}.date .d{font-size:1.5rem;font-weight:800}.date .d small{font-size:.9rem;margin-left:2px}.date .h{font-size:1.15rem;font-weight:600;margin-top:6px}
 .body{min-width:0}.top{display:flex;gap:10px;align-items:center}.av{position:relative;overflow:hidden;flex:none;width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font-weight:800;color:#fff;background:linear-gradient(135deg,var(--pu),var(--pk));border:2px solid var(--card);box-shadow:0 0 0 1px var(--line)}
-.host{font-size:.9rem;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chips{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.host{font-size:.9rem;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hostlink{display:inline-flex;align-items:center;gap:10px;min-width:0;max-width:100%;border:0;background:none;padding:0;margin:0;font:inherit;color:inherit;cursor:pointer;border-radius:999px;text-align:left;text-decoration:none}.hostlink:hover .host,.hostlink:focus-visible .host{color:var(--chtx);text-decoration:underline}.hostlink:focus-visible{outline:2px solid var(--pu);outline-offset:3px}.hostlink .av{pointer-events:none}.hfilter{display:flex;flex-wrap:wrap;gap:10px;align-items:center;background:var(--chbg);border:1px solid var(--chbd);color:var(--ntx);padding:10px 14px;border-radius:14px;font-size:.9rem;margin:0 0 14px}.hfilter b{color:var(--chtx)}.hfilter .sp{flex:1}.chips{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .chip{font-size:.75rem;padding:3px 12px;border-radius:999px;background:var(--chbg);border:1px solid var(--chbd);color:var(--chtx);white-space:nowrap;font-weight:600}.chip.live{background:var(--lvbg);border-color:var(--lvbd);color:var(--lvtx)}.chip.s{color:var(--stx);border-color:var(--sbd);background:var(--sbg)}
 .title{font-size:1.15rem;font-weight:800;margin:10px 0 4px;line-height:1.45;word-break:break-word}.time{color:var(--time);font-size:.88rem;display:flex;gap:10px;flex-wrap:wrap}.time .rel{color:var(--chtx);font-weight:700}
 .acts{grid-column:1/-1;display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.acts form{margin:0}
@@ -164,13 +164,37 @@ const isPast = s => {
 // Calendar date in Asia/Tokyo (YYYY-MM-DD), independent of server/browser local TZ.
 const jstYmd = iso => new Date(iso).toLocaleDateString('en-CA', { timeZone: 'Asia/Tokyo' });
 const isTodayJst = iso => jstYmd(iso) === jstYmd(Date.now());
+const normHost = raw => {
+  const t = String(raw || '').trim().replace(/^@+/, '');
+  return /^[A-Za-z0-9_]{1,40}$/.test(t) ? t : '';
+};
+const boardHref = (tab, host) => {
+  const q = new URLSearchParams();
+  if (tab && tab !== 'upcoming') q.set('tab', tab);
+  if (host) q.set('host', host);
+  const qs = q.toString();
+  return qs ? '/?' + qs : '/';
+};
+// back field: 'upcoming' | 'archive' | 'upcoming|Host' | 'archive|Host' | 'admin'
+const boardBack = raw => {
+  const t = String(raw || '');
+  if (t === 'admin') return '/admin?tab=spaces';
+  const [tabPart, hostPart] = t.split('|');
+  const tab = tabPart === 'archive' ? 'archive' : 'upcoming';
+  return boardHref(tab, normHost(hostPart || ''));
+};
 app.get('/', async (req, res) => {
   const uid = req.session.user?.id;
   const tab = req.query.tab === 'archive' ? 'archive' : 'upcoming';
+  const hostFilter = normHost(req.query.host);
   const cutoff = new Date(Date.now() - CUTOFF_MS).toISOString();
   const base = `SELECT s.*, u.username owner, (SELECT 1 FROM reminders r WHERE r.space_row=s.id AND r.user_id=?) rem FROM spaces s LEFT JOIN users u ON u.id=s.owner_id`;
-  const upcoming = await db.prepare(`${base} WHERE start_at >= ? AND COALESCE(space_state,'') <> 'ended' ORDER BY start_at`).all(uid ?? '', cutoff);
-  const archive = await db.prepare(`${base} WHERE has_recording=1 AND (ended_at IS NOT NULL OR space_state='ended' OR start_at < ?) ORDER BY COALESCE(ended_at, start_at) DESC`).all(uid ?? '', cutoff);
+  // Filter by spaces.host (X Space host username), not listing registrant (owner_id).
+  const hostSql = hostFilter ? ' AND LOWER(s.host)=LOWER(?)' : '';
+  const upArgs = hostFilter ? [uid ?? '', cutoff, hostFilter] : [uid ?? '', cutoff];
+  const arArgs = hostFilter ? [uid ?? '', cutoff, hostFilter] : [uid ?? '', cutoff];
+  const upcoming = await db.prepare(`${base} WHERE start_at >= ? AND COALESCE(space_state,'') <> 'ended'${hostSql} ORDER BY start_at`).all(...upArgs);
+  const archive = await db.prepare(`${base} WHERE has_recording=1 AND (ended_at IS NOT NULL OR space_state='ended' OR start_at < ?)${hostSql} ORDER BY COALESCE(ended_at, start_at) DESC`).all(...arArgs);
   const rows = tab === 'archive' ? archive : upcoming;
   rows.forEach(s => { s.start_at = new Date(s.start_at).toISOString(); if (s.ended_at) s.ended_at = new Date(s.ended_at).toISOString(); });
   const card = s => { const past = tab === 'archive' || isPast(s); const r = rel(s.start_at), live = !past && r === 'LIVE', soon = !past && !live && (new Date(s.start_at) - Date.now()) < 864e5;
@@ -181,18 +205,33 @@ app.get('/', async (req, res) => {
     const statusChip = past ? `<span class="chip arc">🎙 アーカイブ</span>` : `<span class="chip ${live ? 'live' : soon ? 'soon' : ''}">${live ? '● LIVE' : soon ? '⏰ まもなく' : '📅 予定'}</span>`;
     const todayChip = today ? '<span class="chip today">🔥 本日</span>' : '';
     const own = uid && (s.owner_id === uid || req.isAdmin);
-    return `<article class="card${today ? ' today' : ''}"${today ? ' data-today="1"' : ''}><div class="date"><div class="d">${jp({ month: 'numeric', day: 'numeric' })}<small>${jp({ weekday: 'short' })}</small></div><div class="h">${jp({ hour: '2-digit', minute: '2-digit' })}</div></div><div class="body"><div class="top"><div class="av">${esc((s.host || '?')[0].toUpperCase())}<img src="${esc(s.avatar || 'https://unavatar.io/x/' + encodeURIComponent(s.host || ''))}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()"></div><div class="host">@${esc(s.host)}</div>
+    const hName = String(s.host || '').replace(/^@/, '');
+    const hostBtn = hName
+      ? `<a class="hostlink" href="${esc(boardHref(tab, hName))}" title="@${esc(hName)} のスペースを表示" aria-label="ホスト @${esc(hName)} のスペースを表示"><span class="av" aria-hidden="true">${esc((hName || '?')[0].toUpperCase())}<img src="${esc(s.avatar || 'https://unavatar.io/x/' + encodeURIComponent(hName))}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()"></span><span class="host">@${esc(hName)}</span></a>`
+      : `<div class="av">?</div><div class="host">（ホスト不明）</div>`;
+    const backVal = hostFilter ? `${tab}|${hostFilter}` : tab;
+    return `<article class="card${today ? ' today' : ''}"${today ? ' data-today="1"' : ''}><div class="date"><div class="d">${jp({ month: 'numeric', day: 'numeric' })}<small>${jp({ weekday: 'short' })}</small></div><div class="h">${jp({ hour: '2-digit', minute: '2-digit' })}</div></div><div class="body"><div class="top">${hostBtn}
 <div class="chips">${s.demo ? '<span class="chip s">サンプル</span>' : ''}${todayChip}${+s.has_recording && !past ? '<span class="chip arc">🎙 録音予定</span>' : ''}${statusChip}</div></div>
 <div class="title">${esc(s.title)}</div><div class="time"><span class="rel">${past ? '終了' : live ? '配信中' : r}</span><span>🕒 ${fmtShort(s.start_at)} JST</span></div></div>
 <div class="acts"><a class="btn pri" href="${esc(openUrl)}" target="_blank" rel="noopener">${past ? '▶ 録音を聴く' : '▶ 開く'}</a>${past ? '' : `<a class="btn" href="${gcal(s)}" target="_blank" rel="noopener">📅 Googleカレンダー</a><a class="btn" href="/spaces/${s.id}.ics">.ics</a>`}
-${uid ? `${own ? `<a class="btn" href="/spaces/${s.id}/edit">✏️ 編集</a><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('このスペースを削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="${tab}"><button class="btn">🗑 削除</button></form>` : ''}${past ? '' : `<form method="post" action="/spaces/${s.id}/remind"><input type="hidden" name="back" value="${tab}"><button class="btn ${s.rem ? 'on' : ''}">${s.rem ? '🔔 リマインダー中' : '🔕 リマインダー'}</button></form>`}` : (past ? '' : '<a class="btn" href="/login">🔕 リマインダー</a>')}</div></article>`; };
-  const tabs = `<div class="btabs" role="tablist" aria-label="表示切替"><a role="tab" href="/?tab=upcoming" aria-selected="${tab==='upcoming'}" id="tab-upcoming">これからの予定 <span class="n">${upcoming.length}</span></a><a role="tab" href="/?tab=archive" aria-selected="${tab==='archive'}" id="tab-archive">過去のアーカイブ <span class="n">${archive.length}</span></a></div>
-<script>(function(){var h=location.hash.replace(/^#/, '');if(h==='archive'||h==='upcoming'){if(new URLSearchParams(location.search).get('tab')!==h)location.replace('/?tab='+h);}})()</script>`;
+${uid ? `${own ? `<a class="btn" href="/spaces/${s.id}/edit">✏️ 編集</a><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('このスペースを削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="${esc(backVal)}"><button class="btn">🗑 削除</button></form>` : ''}${past ? '' : `<form method="post" action="/spaces/${s.id}/remind"><input type="hidden" name="back" value="${esc(backVal)}"><button class="btn ${s.rem ? 'on' : ''}">${s.rem ? '🔔 リマインダー中' : '🔕 リマインダー'}</button></form>`}` : (past ? '' : '<a class="btn" href="/login">🔕 リマインダー</a>')}</div></article>`; };
+  const tabs = `<div class="btabs" role="tablist" aria-label="表示切替"><a role="tab" href="${esc(boardHref('upcoming', hostFilter))}" aria-selected="${tab==='upcoming'}" id="tab-upcoming">これからの予定 <span class="n">${upcoming.length}</span></a><a role="tab" href="${esc(boardHref('archive', hostFilter))}" aria-selected="${tab==='archive'}" id="tab-archive">過去のアーカイブ <span class="n">${archive.length}</span></a></div>
+<script>(function(){var q=new URLSearchParams(location.search),h=location.hash.replace(/^#/,''),tab=q.get('tab')||'upcoming',host=q.get('host')||'';
+function go(t,ho){var p=new URLSearchParams();if(t&&t!=='upcoming')p.set('tab',t);if(ho)p.set('host',String(ho).replace(/^@/,''));var s=p.toString(),path=s?'/?'+s:'/';if(location.pathname+location.search!==path)location.replace(path)}
+if(/^host=/i.test(h)){var m=h.match(/^host=@?([A-Za-z0-9_]{1,40})$/i);if(m)go(tab,m[1]);}
+else if(h==='archive'||h==='upcoming'){if(q.get('tab')!==h)go(h,host);}})()</script>`;
+  const filterBar = hostFilter
+    ? `<div class="hfilter" role="status" data-host-filter="${esc(hostFilter)}"><span>🎙 ホスト <b>@${esc(hostFilter)}</b> のスペース</span><span class="sp"></span><a class="btn" href="${esc(boardHref(tab, ''))}" aria-label="ホスト絞り込みを解除してすべて表示">✕ すべて表示</a></div>`
+    : '';
   const empty = tab === 'archive'
-    ? '<div class="empty">録音ありのアーカイブはまだありません。<br>終了後、登録者が「録音あり」にするとここに表示されます。</div>'
-    : '<div class="empty">まだ予定がありません。最初のスペースを登録しよう！</div>';
+    ? (hostFilter
+      ? `<div class="empty">このホストの録音アーカイブはありません。</div>`
+      : '<div class="empty">録音ありのアーカイブはまだありません。<br>終了後、登録者が「録音あり」にするとここに表示されます。</div>')
+    : (hostFilter
+      ? `<div class="empty">このホストのこれから予定はありません。</div>`
+      : '<div class="empty">まだ予定がありません。最初のスペースを登録しよう！</div>');
   const heading = tab === 'archive' ? `過去のアーカイブ（録音あり） <b>${rows.length}</b> 件` : `これからのスペース <b>${rows.length}</b> 件`;
-  res.send(page(req, tabs + `<h2>${heading}</h2>` + (rows.length ? '<div class="grid">' + rows.map(card).join('') + '</div>' : empty), true));
+  res.send(page(req, filterBar + tabs + `<h2>${heading}</h2>` + (rows.length ? '<div class="grid">' + rows.map(card).join('') + '</div>' : empty), true));
 });
 // Extract a Space id from x.com/i/spaces/ID, twitter.com, reminder/share links (?id=, /spaces/ID/peek), or a bare id.
 const spaceIdOf = raw => { const t = String(raw || '').trim(); let m = /spaces\/([A-Za-z0-9]{8,20})/i.exec(t) || /[?&](?:space_?id|id)=([A-Za-z0-9]{8,20})/i.exec(t) || /^([A-Za-z0-9]{8,20})$/.exec(t) || /(?:^|[^A-Za-z0-9])(1[A-Za-z0-9]{12})(?![A-Za-z0-9])/.exec(t); return m ? m[1] : null; };
@@ -259,8 +298,7 @@ app.post('/spaces/:id/remind', auth, async (req, res) => {
   const u = req.session.user.id, id = +req.params.id;
   if (await db.prepare('SELECT 1 FROM reminders WHERE user_id=? AND space_row=?').get(u, id)) await db.prepare('DELETE FROM reminders WHERE user_id=? AND space_row=?').run(u, id);
   else await db.prepare('INSERT INTO reminders(user_id,space_row) VALUES(?,?)').run(u, id);
-  const back = req.body.back === 'archive' ? '/?tab=archive' : '/';
-  res.redirect(back);
+  res.redirect(boardBack(req.body.back));
 });
 app.get('/spaces/:id.ics', async (req, res) => {
   const s = await db.prepare('SELECT * FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.sendStatus(404);
@@ -272,8 +310,7 @@ app.post('/spaces/:id/delete', auth, async (req, res) => {
   const s = await db.prepare('SELECT owner_id FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.redirect('/');
   if (s.owner_id !== req.session.user.id && !req.isAdmin) return res.sendStatus(403);
   await db.prepare('DELETE FROM reminders WHERE space_row=?').run(+req.params.id); await db.prepare('DELETE FROM spaces WHERE id=?').run(+req.params.id);
-  const back = req.body.back === 'admin' ? '/admin?tab=spaces' : req.body.back === 'archive' ? '/?tab=archive' : '/';
-  res.redirect(back);
+  res.redirect(req.body.back === 'admin' ? '/admin?tab=spaces' : boardBack(req.body.back));
 });
 // ---- Edit space (owner / admin): mark recording, fix metadata ----
 app.get('/spaces/:id/edit', auth, async (req, res) => {
@@ -335,12 +372,12 @@ app.get('/admin', admin, async (req, res) => {
   const spaces = await db.prepare(SPACES_SQL).all(q, q, q, q);
   const act = (u, a, label, cls = '') => `<form method="post" action="/admin/users/${encodeURIComponent(u.id)}/${a}">${csrfIn(req)}<button class="btn ${cls}">${label}</button></form>`;
   const urow = u => { const r = roleOf(u), fixed = envAdmin(u.username), self = u.id === req.session.user.id;
-    return `<tr><td><div class="uc">${av(u.username, u.avatar)}<div><div class="n">${esc(u.name || '')}</div><div class="h">@${esc(u.username)}</div></div></div></td>
+    return `<tr><td><a class="uc hostlink" href="${esc(boardHref('upcoming', u.username))}" title="@${esc(u.username)} のスペースを表示" aria-label="@${esc(u.username)} のホストスペースを表示">${av(u.username, u.avatar)}<div><div class="n">${esc(u.name || '')}</div><div class="h">@${esc(u.username)}</div></div></a></td>
 <td><span class="chip ${r === 'admin' ? '' : 's'}">${r === 'admin' ? '🛡 管理者' : '👤 ユーザー'}${fixed ? '（固定）' : ''}</span></td>
 <td><span class="chip ${u.status === 'banned' ? 'live' : 'ok'}">${u.status === 'banned' ? '⛔ 停止中' : '✓ 有効'}</span></td>
 <td>${jst(u.first_login)}</td><td>${jst(u.last_login)}</td><td class="num">${u.login_count || 0}</td><td class="num">${u.spaces}</td>
 <td><div class="acts2">${fixed || self ? '<span class="h" style="color:var(--mut);font-size:.78rem">—</span>' : (r === 'admin' ? act(u, 'demote', '👤 ユーザーにする') : act(u, 'promote', '🛡 管理者にする')) + (u.status === 'banned' ? act(u, 'unban', '✓ 停止解除') : act(u, 'ban', '⛔ 停止', 'dng'))}</div></td></tr>`; };
-  const srow = s => `<tr><td class="tl"><a href="${esc(s.url)}" target="_blank" rel="noopener"><b>${esc(s.title)}</b></a></td><td>@${esc(s.host)}</td><td>${jst(s.start_at)}</td><td>${+s.has_recording ? '🎙 あり' : '—'}</td><td>@${esc(s.owner || '')}</td><td>${jst(s.created_at)}</td>
+  const srow = s => `<tr><td class="tl"><a href="${esc(s.url)}" target="_blank" rel="noopener"><b>${esc(s.title)}</b></a></td><td><a href="${esc(boardHref('upcoming', String(s.host||'').replace(/^@/,'')))}">@${esc(s.host)}</a></td><td>${jst(s.start_at)}</td><td>${+s.has_recording ? '🎙 あり' : '—'}</td><td>@${esc(s.owner || '')}</td><td>${jst(s.created_at)}</td>
 <td><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="admin"><button class="btn dng" style="padding:5px 10px;font-size:.78rem">🗑 削除</button></form></td></tr>`;
   const t = (h, rows) => `<div class="tbl"><table><thead><tr>${h.map(x => `<th>${x}</th>`).join('')}</tr></thead><tbody>${rows || `<tr><td colspan="${h.length}" style="text-align:center;color:var(--mut)">該当なし</td></tr>`}</tbody></table></div>`;
   res.send(page(req, `${ADMCSS}<h2><b>🛡 管理画面</b> · ログインしたXアカウントとスペースの管理</h2>
