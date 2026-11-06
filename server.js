@@ -223,6 +223,7 @@ app.get('/', async (req, res) => {
   upcoming.forEach(s => { s.start_at = new Date(s.start_at).toISOString(); if (s.ended_at) s.ended_at = new Date(s.ended_at).toISOString(); });
   archive.forEach(s => { s.start_at = new Date(s.start_at).toISOString(); if (s.ended_at) s.ended_at = new Date(s.ended_at).toISOString(); });
   if (tab !== 'archive') await refreshDueSpaceStates(upcoming, 3, req);
+  else await refreshDueSpaceStates(archive, 2, req);
   const rows = tab === 'archive' ? archive : upcoming;
   const card = s => { const past = tab === 'archive' || isPast(s); const r = rel(s.start_at);
     // LIVE only when X says Running (stored space_state) — clock-due is 「開始待ち」, not LIVE.
@@ -590,8 +591,9 @@ async function refreshSpaceStateRow(row, req) {
         return row;
       }
       if (st === 'ended' || st === 'canceled') {
-        await persistSpaceState(row, { space_state: st, live_space_id: null, ended_at: sp.ended_at || new Date().toISOString() });
-        return row;
+        await persistSpaceState(row, { space_state: st, live_space_id: row.live_space_id || null, ended_at: sp.ended_at || new Date().toISOString() });
+        // Fall through so we can still attach a twin recording id when missing.
+        if (row.live_space_id) return row;
       }
       if (st) await persistSpaceState(row, { space_state: st });
     } catch (e) {
@@ -601,7 +603,7 @@ async function refreshSpaceStateRow(row, req) {
     // Scheduled reminder ids often stay "scheduled" after go-live; X creates a NEW live id.
     const t0 = new Date(row.start_at).getTime();
     const near = t0 >= now - 3 * 3600e3 && t0 <= now + 30 * 60e3;
-    if (near && st !== 'live' && row.space_state !== 'live') {
+    if (near && st !== 'live' && (row.space_state !== 'live' || !row.live_space_id)) {
       const { live: liveTwin, ended: endedTwin } = await resolveLiveTwin(row, req);
       if (liveTwin && liveTwin.id) {
         await persistSpaceState(row, { space_state: 'live', live_space_id: liveTwin.id });
@@ -619,7 +621,9 @@ async function refreshDueSpaceStates(rows, limit = 3, req) {
   const due = rows.filter(s => !s.demo && s.space_id && (() => {
     const t = new Date(s.start_at).getTime();
     // Near/past start: 3h after scheduled start through 30m before.
-    return t >= now - 3 * 3600e3 && t <= now + 30 * 60e3;
+    if (!(t >= now - 3 * 3600e3 && t <= now + 30 * 60e3)) return false;
+    if (s.space_state === 'ended' || s.space_state === 'canceled') return !s.live_space_id;
+    return true;
   })()).slice(0, limit);
   for (const row of due) await refreshSpaceStateRow(row, req);
   return rows;
@@ -787,9 +791,10 @@ setInterval(async () => { try {
   await pool.query('DELETE FROM sessions WHERE expire<now()');
   await pool.query(`UPDATE spaces SET space_state='ended', ended_at=COALESCE(ended_at, start_at + interval '1 hour')
     WHERE COALESCE(space_state,'') NOT IN ('ended','canceled') AND start_at < now() - interval '3 hours'`);
-  const due = await db.prepare(`SELECT id, space_id, live_space_id, demo, space_state, start_at, title, host FROM spaces
-    WHERE COALESCE(demo,0)=0 AND COALESCE(space_state,'') NOT IN ('ended','canceled')
+  const due = await db.prepare(`SELECT id, space_id, live_space_id, demo, space_state, start_at, title, host, ended_at FROM spaces
+    WHERE COALESCE(demo,0)=0
       AND start_at >= now() - interval '3 hours' AND start_at <= now() + interval '30 minutes'
+      AND (COALESCE(space_state,'') NOT IN ('ended','canceled') OR live_space_id IS NULL)
     ORDER BY start_at LIMIT 5`).all();
   for (const row of due) await refreshSpaceStateRow(row);
 } catch (e) { console.error('maintenance job', e.message); }
