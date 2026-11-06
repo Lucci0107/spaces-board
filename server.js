@@ -1,6 +1,7 @@
 // Spaces Board MVP. Credentials only from env: X_CLIENT_ID, X_CLIENT_SECRET (optional), BASE_URL, SESSION_SECRET.
 const express = require('express'), session = require('express-session'), crypto = require('crypto');
 const { Pool } = require('pg');
+const webpush = require('web-push');
 const PORT = process.env.PORT || 3000, BASE = process.env.BASE_URL || `http://localhost:${PORT}`;
 const CID = process.env.X_CLIENT_ID, CSEC = process.env.X_CLIENT_SECRET;
 const DEMO = !CID;
@@ -26,7 +27,11 @@ ALTER TABLE spaces ADD COLUMN IF NOT EXISTS recording_url TEXT;
 ALTER TABLE spaces ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
 ALTER TABLE spaces ADD COLUMN IF NOT EXISTS space_state TEXT;
 CREATE TABLE IF NOT EXISTS reminders(user_id TEXT, space_row INTEGER, minutes_before INTEGER DEFAULT 15, sent INTEGER DEFAULT 0, PRIMARY KEY(user_id, space_row));
-CREATE TABLE IF NOT EXISTS sessions(sid TEXT PRIMARY KEY, sess JSONB NOT NULL, expire TIMESTAMPTZ NOT NULL);`);
+CREATE TABLE IF NOT EXISTS sessions(sid TEXT PRIMARY KEY, sess JSONB NOT NULL, expire TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS push_subs(endpoint TEXT PRIMARY KEY, user_id TEXT NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now());
+CREATE INDEX IF NOT EXISTS push_subs_user_idx ON push_subs(user_id);`);
+  // Normalize stored Space URLs so LIVE opens the room, not /peek reminders.
+  try { await pool.query(`UPDATE spaces SET url = 'https://x.com/i/spaces/' || space_id WHERE space_id ~ '^[A-Za-z0-9]{8,25}$' AND (url ILIKE '%/peek%' OR url ~ '[?&#]')`); } catch (e) { console.warn('url normalize', e.message); }
   if (DEMO && !(await db.prepare('SELECT 1 FROM spaces WHERE demo=1').get())) {
     const ins = db.prepare('INSERT INTO spaces(space_id,url,title,host,start_at,owner_id,demo,has_recording,recording_url,space_state,ended_at) VALUES(?,?,?,?,?,?,1,?,?,?,?)');
     // First upcoming sample is always "today" in JST (evening if morning, +90m if late); others stay later.
@@ -66,6 +71,7 @@ const app = express(); app.set('trust proxy', 1);
 // Static icons/OG image before DB + session middleware; cached (1 day, 1 week for og/icons is fine to refresh via filename change).
 app.use(express.static(require('path').join(__dirname, 'public'), { maxAge: '7d', setHeaders: (res, p) => { if (p.endsWith('.webmanifest')) res.type('application/manifest+json'); } }));
 app.use(express.urlencoded({ extended: false }));
+app.use(express.json({ limit: '32kb' }));
 app.use(async (req, res, next) => { try { await ready; next(); } catch (e) { next(e); } });
 app.use(session({ store: new PgStore(), cookie: { maxAge: 30 * 864e5, secure: 'auto', sameSite: 'lax' }, secret: process.env.SESSION_SECRET || crypto.randomBytes(16).toString('hex'), resave: false, saveUninitialized: false }));
 app.use(async (req, res, next) => {
@@ -117,7 +123,27 @@ const page = (req, body, hero = false) => `<!doctype html><html lang="ja" data-t
 ${hero ? `<section class="hero"><h1>スペースの予定を、<em>みんなで共有。</em></h1><p>Xスペースの開催予定を登録して一覧で見られる掲示板。気になる回はリマインダーやカレンダーに追加して、聞き逃しを防ごう。</p></section>` : ''}
 ${DEMO ? '<div class="notice">✨ <div><b>デモモード</b>：Xのキー未設定のため、疑似ユーザーでログインし、サンプルデータを表示しています。</div></div>' : ''}
 ${body}<footer>Spaces Board · 時刻はすべて日本時間 (JST)</footer></div></body></html>`;
-const gcal = s => { const f = t => new Date(t).toISOString().replace(/[-:]/g,'').replace(/\.\d{3}/,''); return 'https://calendar.google.com/calendar/render?' + new URLSearchParams({ action: 'TEMPLATE', text: s.title, dates: f(s.start_at) + '/' + f(new Date(s.start_at).getTime() + 3600e3), details: s.url, location: s.url }); };
+const spaceIdFromStored = s => {
+  const sid = String(s?.space_id || '').trim();
+  if (/^[A-Za-z0-9]{8,25}$/.test(sid)) return sid;
+  const u = String(s?.url || '');
+  const m = /(?:^|\/)(?:i\/)?spaces\/([A-Za-z0-9]{8,25})(?:\/|\?|#|$)/i.exec(u) || /[?&](?:space_?id|id)=([A-Za-z0-9]{8,25})/i.exec(u);
+  return m ? m[1] : null;
+};
+// LIVE room URL — never /peek or share query params (those stay on the reminder page).
+const spaceOpenUrl = s => {
+  const id = spaceIdFromStored(s);
+  if (id) return `https://x.com/i/spaces/${id}`;
+  return String(s?.url || '').replace(/\/peek(?=\?|$)/i, '').replace(/\?.*$/, '') || 'https://x.com/i/spaces';
+};
+const gcal = s => { const link = spaceOpenUrl(s); const f = t => new Date(t).toISOString().replace(/[-:]/g,'').replace(/\.\d{3}/,''); return 'https://calendar.google.com/calendar/render?' + new URLSearchParams({ action: 'TEMPLATE', text: s.title, dates: f(s.start_at) + '/' + f(new Date(s.start_at).getTime() + 3600e3), details: link, location: link }); };
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || '';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:noreply@spaces-board.onrender.com';
+const CRON_SECRET = process.env.CRON_SECRET || '';
+const PUSH_READY = !!(VAPID_PUBLIC && VAPID_PRIVATE);
+if (PUSH_READY) webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
+
 const b64u = b => b.toString('base64url');
 const STATE_KEY = process.env.SESSION_SECRET || 'dev-state-key';
 const ADMINS = new Set(String(process.env.ADMIN_USERNAMES || '').split(',').map(x => x.trim().replace(/^@/, '').toLowerCase()).filter(Boolean));
@@ -204,7 +230,7 @@ app.get('/', async (req, res) => {
   const card = s => { const past = tab === 'archive' || isPast(s); const r = rel(s.start_at), live = !past && r === 'LIVE', soon = !past && !live && (new Date(s.start_at) - Date.now()) < 864e5;
     const today = !past && isTodayJst(s.start_at);
     const dt = new Date(s.start_at), jp = o => dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', ...o });
-    const openUrl = (past && s.recording_url) ? s.recording_url : s.url;
+    const openUrl = (past && s.recording_url) ? s.recording_url : spaceOpenUrl(s);
     // LIVE chip stays for live spaces; 「本日」 is an extra badge for JST calendar-today.
     const statusChip = past ? `<span class="chip arc">🎙 アーカイブ</span>` : `<span class="chip ${live ? 'live' : soon ? 'soon' : ''}">${live ? '● LIVE' : soon ? '⏰ まもなく' : '📅 予定'}</span>`;
     const todayChip = today ? '<span class="chip today">🔥 本日</span>' : '';
@@ -218,7 +244,7 @@ app.get('/', async (req, res) => {
 <div class="chips">${s.demo ? '<span class="chip s">サンプル</span>' : ''}${todayChip}${+s.has_recording && !past ? '<span class="chip arc">🎙 録音予定</span>' : ''}${statusChip}</div></div>
 <div class="title">${esc(s.title)}</div><div class="time"><span class="rel">${past ? '終了' : live ? '配信中' : r}</span><span>🕒 ${fmtShort(s.start_at)} JST</span></div></div>
 <div class="acts"><a class="btn pri" href="${esc(openUrl)}" target="_blank" rel="noopener">${past ? '▶ 録音を聴く' : '▶ 開く'}</a>${past ? '' : `<a class="btn" href="${gcal(s)}" target="_blank" rel="noopener">📅 Googleカレンダー</a><a class="btn" href="/spaces/${s.id}.ics">.ics</a>`}
-${uid ? `${own ? `<a class="btn" href="/spaces/${s.id}/edit">✏️ 編集</a><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('このスペースを削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="${esc(backVal)}"><button class="btn">🗑 削除</button></form>` : ''}${past ? '' : `<form method="post" action="/spaces/${s.id}/remind"><input type="hidden" name="back" value="${esc(backVal)}"><button class="btn ${s.rem ? 'on' : ''}">${s.rem ? '🔔 リマインダー中' : '🔕 リマインダー'}</button></form>`}` : (past ? '' : '<a class="btn" href="/login">🔕 リマインダー</a>')}</div></article>`; };
+${uid ? `${own ? `<a class="btn" href="/spaces/${s.id}/edit">✏️ 編集</a><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('このスペースを削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="${esc(backVal)}"><button class="btn">🗑 削除</button></form>` : ''}${past ? '' : `<form class="rem-form" method="post" action="/spaces/${s.id}/remind" data-rem-on="${s.rem ? '0' : '1'}"><input type="hidden" name="back" value="${esc(backVal)}"><button type="submit" class="btn ${s.rem ? 'on' : ''}" title="開始15分前にブラウザに通知します">${s.rem ? '🔔 リマインダー中' : '🔕 リマインダー'}</button></form>`}` : (past ? '' : '<a class="btn" href="/login" title="開始15分前にブラウザに通知します">🔕 リマインダー</a>')}</div></article>`; };
   const tabs = `<div class="btabs" role="tablist" aria-label="表示切替"><a role="tab" href="${esc(boardHref('upcoming', hostFilter))}" aria-selected="${tab==='upcoming'}" id="tab-upcoming">これからの予定 <span class="n">${upcoming.length}</span></a><a role="tab" href="${esc(boardHref('archive', hostFilter))}" aria-selected="${tab==='archive'}" id="tab-archive">過去のアーカイブ <span class="n">${archive.length}</span></a></div>
 <script>(function(){var q=new URLSearchParams(location.search),h=location.hash.replace(/^#/,''),tab=q.get('tab')||'upcoming',host=q.get('host')||'';
 function go(t,ho){var p=new URLSearchParams();if(t&&t!=='upcoming')p.set('tab',t);if(ho)p.set('host',String(ho).replace(/^@/,''));var s=p.toString(),path=s?'/?'+s:'/';if(location.pathname+location.search!==path)location.replace(path)}
@@ -235,7 +261,38 @@ else if(h==='archive'||h==='upcoming'){if(q.get('tab')!==h)go(h,host);}})()</scr
       ? `<div class="empty">このホストのこれから予定はありません。</div>`
       : '<div class="empty">まだ予定がありません。最初のスペースを登録しよう！</div>');
   const heading = tab === 'archive' ? `過去のアーカイブ（録音あり） <b>${rows.length}</b> 件` : `これからのスペース <b>${rows.length}</b> 件`;
-  res.send(page(req, filterBar + tabs + `<h2>${heading}</h2>` + (rows.length ? '<div class="grid">' + rows.map(card).join('') + '</div>' : empty), true));
+  const needPush = !!(uid && (upcoming.some(x => x.rem) || archive.some(x => x.rem)));
+  const pushBoot = (uid && PUSH_READY) ? `<div id="push-msg" class="notice" style="display:none;margin:0 0 14px"></div>
+<script>
+window.__SB_PUSH__={vapid:${JSON.stringify(VAPID_PUBLIC)},need:${needPush ? 'true' : 'false'}};
+(function(){
+  if(!window.__SB_PUSH__.vapid||!('serviceWorker' in navigator)||!('PushManager' in window)) return;
+  function b64(s){var p='='.repeat((4-s.length%4)%4),r=(s+p).replace(/-/g,'+').replace(/_/g,'/');var raw=atob(r),o=new Uint8Array(raw.length);for(var i=0;i<raw.length;i++)o[i]=raw.charCodeAt(i);return o}
+  function showPushMsg(t){var el=document.getElementById('push-msg'); if(!el) return; el.style.display='flex'; el.innerHTML='🔔 <div>'+t+'</div>'}
+  async function ensurePush(){
+    try{
+      var reg=await navigator.serviceWorker.register('/sw.js',{scope:'/'});
+      await navigator.serviceWorker.ready;
+      var perm=Notification.permission;
+      if(perm==='denied'){showPushMsg('ブラウザ通知がブロックされています。設定から許可してください（iOSはホーム画面追加が必要な場合があります）。');return false}
+      if(perm!=='granted'){perm=await Notification.requestPermission(); if(perm!=='granted'){showPushMsg('通知が許可されませんでした。リマインダーはブラウザ通知で届きます。');return false}}
+      var sub=await reg.pushManager.getSubscription();
+      if(!sub) sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64(window.__SB_PUSH__.vapid)});
+      await fetch('/api/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(sub)});
+      return true;
+    }catch(e){console.warn('push subscribe',e);showPushMsg('通知の登録に失敗しました。HTTPSと通知許可を確認してください。');return false}
+  }
+  document.querySelectorAll('form.rem-form').forEach(function(f){
+    f.addEventListener('submit',function(ev){
+      if(f.getAttribute('data-rem-on')!=='1') return;
+      ev.preventDefault();
+      ensurePush().finally(function(){ HTMLFormElement.prototype.submit.call(f); });
+    });
+  });
+  if(window.__SB_PUSH__.need) ensurePush();
+})();
+</script>` : '';
+  res.send(page(req, filterBar + tabs + pushBoot + `<h2>${heading}</h2>` + (rows.length ? '<div class="grid">' + rows.map(card).join('') + '</div>' : empty), true));
 });
 // Extract a Space id from x.com/i/spaces/ID, twitter.com, reminder/share links (?id=, /spaces/ID/peek), or a bare id.
 const spaceIdOf = raw => {
@@ -462,7 +519,8 @@ app.post('/spaces/:id/remind', auth, async (req, res) => {
 app.get('/spaces/:id.ics', async (req, res) => {
   const s = await db.prepare('SELECT * FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.sendStatus(404);
   const d = x => new Date(x).toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
-  res.type('text/calendar').attachment(`space-${s.id}.ics`).send(['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//SpacesBoard//JA','BEGIN:VEVENT',`UID:space-${s.id}@spaces-board`,`DTSTAMP:${d(Date.now())}`,`DTSTART:${d(s.start_at)}`,`DTEND:${d(new Date(s.start_at).getTime()+3600e3)}`,`SUMMARY:${s.title.replace(/[,;\n]/g,' ')}`,`URL:${s.url}`,`DESCRIPTION:${s.url}`,'BEGIN:VALARM','TRIGGER:-PT15M','ACTION:DISPLAY','DESCRIPTION:スペース開始15分前','END:VALARM','END:VEVENT','END:VCALENDAR'].join('\r\n'));
+  const link = spaceOpenUrl(s);
+  res.type('text/calendar').attachment(`space-${s.id}.ics`).send(['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//SpacesBoard//JA','BEGIN:VEVENT',`UID:space-${s.id}@spaces-board`,`DTSTAMP:${d(Date.now())}`,`DTSTART:${d(s.start_at)}`,`DTEND:${d(new Date(s.start_at).getTime()+3600e3)}`,`SUMMARY:${s.title.replace(/[,;\n]/g,' ')}`,`URL:${link}`,`DESCRIPTION:${link}`,'BEGIN:VALARM','TRIGGER:-PT15M','ACTION:DISPLAY','DESCRIPTION:スペース開始15分前','END:VALARM','END:VEVENT','END:VCALENDAR'].join('\r\n'));
 });
 app.post('/spaces/:id/delete', auth, async (req, res) => {
   if (!csrfOk(req)) return res.status(403).send('CSRF error');
@@ -497,7 +555,8 @@ app.post('/spaces/:id/edit', auth, async (req, res) => {
   const hasRec = req.body.has_recording === '1' || req.body.has_recording === 'on' ? 1 : 0;
   let recUrl = String(req.body.recording_url || '').trim() || null;
   if (recUrl && !/^https?:\/\//i.test(recUrl)) recUrl = null;
-  await db.prepare('UPDATE spaces SET title=?, host=?, start_at=?, has_recording=?, recording_url=? WHERE id=?').run(title, host || s.host, startIso, hasRec, recUrl, s.id);
+  const canon = s.space_id ? `https://x.com/i/spaces/${s.space_id}` : spaceOpenUrl({ ...s, url: s.url });
+  await db.prepare('UPDATE spaces SET title=?, host=?, start_at=?, has_recording=?, recording_url=?, url=? WHERE id=?').run(title, host || s.host, startIso, hasRec, recUrl, canon, s.id);
   res.redirect(hasRec && isPast({ ...s, start_at: startIso, has_recording: hasRec }) ? '/?tab=archive' : '/');
 });
 app.post('/spaces/:id/refresh', auth, async (req, res) => {
@@ -536,7 +595,7 @@ app.get('/admin', admin, async (req, res) => {
 <td><span class="chip ${u.status === 'banned' ? 'live' : 'ok'}">${u.status === 'banned' ? '⛔ 停止中' : '✓ 有効'}</span></td>
 <td>${jst(u.first_login)}</td><td>${jst(u.last_login)}</td><td class="num">${u.login_count || 0}</td><td class="num">${u.spaces}</td>
 <td><div class="acts2">${fixed || self ? '<span class="h" style="color:var(--mut);font-size:.78rem">—</span>' : (r === 'admin' ? act(u, 'demote', '👤 ユーザーにする') : act(u, 'promote', '🛡 管理者にする')) + (u.status === 'banned' ? act(u, 'unban', '✓ 停止解除') : act(u, 'ban', '⛔ 停止', 'dng'))}</div></td></tr>`; };
-  const srow = s => `<tr><td class="tl"><a href="${esc(s.url)}" target="_blank" rel="noopener"><b>${esc(s.title)}</b></a></td><td><a href="${esc(boardHref('upcoming', String(s.host||'').replace(/^@/,'')))}">@${esc(s.host)}</a></td><td>${jst(s.start_at)}</td><td>${+s.has_recording ? '🎙 あり' : '—'}</td><td>@${esc(s.owner || '')}</td><td>${jst(s.created_at)}</td>
+  const srow = s => `<tr><td class="tl"><a href="${esc(spaceOpenUrl(s))}" target="_blank" rel="noopener"><b>${esc(s.title)}</b></a></td><td><a href="${esc(boardHref('upcoming', String(s.host||'').replace(/^@/,'')))}">@${esc(s.host)}</a></td><td>${jst(s.start_at)}</td><td>${+s.has_recording ? '🎙 あり' : '—'}</td><td>@${esc(s.owner || '')}</td><td>${jst(s.created_at)}</td>
 <td><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="admin"><button class="btn dng" style="padding:5px 10px;font-size:.78rem">🗑 削除</button></form></td></tr>`;
   const t = (h, rows) => `<div class="tbl"><table><thead><tr>${h.map(x => `<th>${x}</th>`).join('')}</tr></thead><tbody>${rows || `<tr><td colspan="${h.length}" style="text-align:center;color:var(--mut)">該当なし</td></tr>`}</tbody></table></div>`;
   res.send(page(req, `${ADMCSS}<h2><b>🛡 管理画面</b> · ログインしたXアカウントとスペースの管理</h2>
@@ -562,15 +621,80 @@ app.get('/admin/users.csv', admin, async (req, res) => { const rows = await db.p
   sendCsv(res, 'users.csv', ['X ID', 'ユーザー名', '名前', 'プロフィール画像', '権限', '状態', '初回ログイン(JST)', '最終ログイン(JST)', 'ログイン回数', '登録スペース数'], rows.map(u => [u.id, u.username, u.name, u.avatar, roleOf(u), u.status || 'active', jst(u.first_login), jst(u.last_login), u.login_count || 0, u.spaces])); });
 app.get('/admin/spaces.csv', admin, async (req, res) => { const rows = await db.prepare(SPACES_SQL).all('', '', '', '');
   sendCsv(res, 'spaces.csv', ['ID', 'スペースID', 'タイトル', 'ホスト', '開始(JST)', 'URL', '録音あり', '録音URL', '状態', '登録者', '登録日時(JST)'], rows.map(s => [s.id, s.space_id, s.title, s.host, jst(s.start_at), s.url, +s.has_recording ? 'yes' : 'no', s.recording_url || '', s.space_state || '', s.owner, jst(s.created_at)])); });
-app.get('/healthz', (req, res) => res.json({ ok: true, demo: DEMO }));
-// Reminder job stub: every minute, find due reminders. Delivery channel (email / web push / DM via dm.write) TBD.
-setInterval(async () => { try {
-  const due = await db.prepare(`SELECT r.user_id, r.space_row, s.title, s.start_at, u.username FROM reminders r JOIN spaces s ON s.id=r.space_row JOIN users u ON u.id=r.user_id WHERE r.sent=0 AND s.start_at - make_interval(mins => r.minutes_before) <= now()`).all();
-  for (const r of due) { console.log(`[reminder stub] @${r.username}: 「${r.title}」 ${fmt(r.start_at)}`); await db.prepare('UPDATE reminders SET sent=1 WHERE user_id=? AND space_row=?').run(r.user_id, r.space_row); }
+app.get('/healthz', (req, res) => res.json({ ok: true, demo: DEMO, push: PUSH_READY }));
+app.post('/api/push/subscribe', auth, async (req, res) => {
+  if (!PUSH_READY) return res.status(503).json({ error: 'push not configured' });
+  const sub = req.body || {};
+  const endpoint = String(sub.endpoint || '');
+  const p256dh = String(sub.keys?.p256dh || '');
+  const authk = String(sub.keys?.auth || '');
+  if (!endpoint.startsWith('https://') || !p256dh || !authk) return res.status(400).json({ error: 'bad subscription' });
+  await db.prepare(`INSERT INTO push_subs(endpoint,user_id,p256dh,auth) VALUES(?,?,?,?)
+    ON CONFLICT(endpoint) DO UPDATE SET user_id=EXCLUDED.user_id, p256dh=EXCLUDED.p256dh, auth=EXCLUDED.auth`).run(endpoint, req.session.user.id, p256dh, authk);
+  res.json({ ok: true });
+});
+app.post('/api/push/unsubscribe', auth, async (req, res) => {
+  const endpoint = String(req.body?.endpoint || '');
+  if (endpoint) await db.prepare('DELETE FROM push_subs WHERE endpoint=? AND user_id=?').run(endpoint, req.session.user.id);
+  res.json({ ok: true });
+});
+function jstHM(iso) {
+  return new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hour12: false });
+}
+async function runReminderJob() {
+  // Due: within minutes_before of start, or already started but still in the live window (< start+1h),
+  // and not ended / not older than ~2h (so a slept free-tier instance can still notify on wake).
+  const due = await db.prepare(`SELECT r.user_id, r.space_row, r.minutes_before, s.title, s.start_at, s.space_id, s.url, s.space_state, u.username
+    FROM reminders r JOIN spaces s ON s.id=r.space_row JOIN users u ON u.id=r.user_id
+    WHERE r.sent=0
+      AND COALESCE(s.space_state,'') NOT IN ('ended','canceled')
+      AND s.start_at > now() - interval '2 hours'
+      AND (
+        s.start_at - make_interval(mins => COALESCE(r.minutes_before,15)) <= now()
+        OR (s.start_at <= now() AND s.start_at > now() - interval '1 hour')
+      )`).all();
+  let sent = 0, missing = 0, failed = 0;
+  for (const row of due) {
+    const open = spaceOpenUrl(row);
+    const startMs = new Date(row.start_at).getTime();
+    const live = startMs <= Date.now();
+    const body = live ? 'LIVE中です' : `もう${jstHM(row.start_at)}に始まります`;
+    const payload = JSON.stringify({ title: row.title || 'Spaces Board', body, url: open, tag: 'space-' + row.space_row });
+    const subs = PUSH_READY ? await db.prepare('SELECT endpoint, p256dh, auth FROM push_subs WHERE user_id=?').all(row.user_id) : [];
+    if (!subs.length) { console.log('[reminder] no push sub for', row.username, row.space_row); missing++; }
+    for (const sub of subs) {
+      try {
+        await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, payload, { TTL: 3600, urgency: 'high' });
+        sent++;
+      } catch (e) {
+        failed++;
+        const code = e.statusCode;
+        console.warn('[reminder] push fail', code || e.message);
+        if (code === 404 || code === 410) await db.prepare('DELETE FROM push_subs WHERE endpoint=?').run(sub.endpoint);
+      }
+    }
+    // Always mark sent after attempt so we don't loop (even with no subscription).
+    await db.prepare('UPDATE reminders SET sent=1 WHERE user_id=? AND space_row=?').run(row.user_id, row.space_row);
+  }
   await pool.query('DELETE FROM sessions WHERE expire<now()');
-  // Mark clearly-past spaces as ended when no fresher state (keeps archive eligibility without deleting rows).
   await pool.query(`UPDATE spaces SET space_state='ended', ended_at=COALESCE(ended_at, start_at + interval '1 hour')
     WHERE COALESCE(space_state,'') NOT IN ('ended','canceled') AND start_at < now() - interval '3 hours'`);
-} catch (e) { console.error('reminder job', e.message); }
-}, 60e3);
-app.listen(PORT, () => console.log(`Spaces Board on ${BASE} (demo=${DEMO})`));
+  return { due: due.length, sent, missing, failed };
+}
+const cronAuth = req => {
+  const h = String(req.headers.authorization || '');
+  const got = h.startsWith('Bearer ') ? h.slice(7) : '';
+  return !!(CRON_SECRET && got && got.length === CRON_SECRET.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(CRON_SECRET)));
+};
+app.post('/internal/reminders', async (req, res) => {
+  if (!cronAuth(req)) return res.status(401).json({ error: 'unauthorized' });
+  try { res.json({ ok: true, ...(await runReminderJob()) }); }
+  catch (e) { console.error('reminder job', e.message); res.status(500).json({ error: 'job failed' }); }
+});
+app.get('/internal/reminders', async (req, res) => {
+  if (!cronAuth(req)) return res.status(401).json({ error: 'unauthorized' });
+  try { res.json({ ok: true, ...(await runReminderJob()) }); }
+  catch (e) { console.error('reminder job', e.message); res.status(500).json({ error: 'job failed' }); }
+});
+setInterval(async () => { try { await runReminderJob(); } catch (e) { console.error('reminder job', e.message); } }, 60e3);
+app.listen(PORT, () => console.log(`Spaces Board on ${BASE} (demo=${DEMO}, push=${PUSH_READY})`));
