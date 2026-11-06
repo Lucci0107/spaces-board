@@ -231,7 +231,7 @@ app.get('/', async (req, res) => {
     const soon = !past && !live && !waiting && (new Date(s.start_at) - Date.now()) < 864e5;
     const today = !past && isTodayJst(s.start_at);
     const dt = new Date(s.start_at), jp = o => dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', ...o });
-    const openUrl = (past && s.recording_url) ? s.recording_url : spaceOpenUrl(s);
+    const openUrl = (past && s.recording_url && !s.live_space_id) ? s.recording_url : spaceOpenUrl(s);
     const statusChip = past ? `<span class="chip arc">🎙 アーカイブ</span>` : `<span class="chip ${live ? 'live' : (waiting || soon) ? 'soon' : ''}">${live ? '● LIVE' : waiting ? '⏳ 開始待ち' : soon ? '⏰ まもなく' : '📅 予定'}</span>`;
     const todayChip = today ? '<span class="chip today">🔥 本日</span>' : '';
     const own = uid && (s.owner_id === uid || req.isAdmin);
@@ -572,7 +572,8 @@ async function refreshSpaceStateRow(row, req) {
           return row;
         }
         if (tst === 'ended' || tst === 'canceled') {
-          await persistSpaceState(row, { space_state: tst, live_space_id: null, ended_at: twin.ended_at || new Date().toISOString() });
+          // Keep live_space_id so 開く still targets the real room/recording, not the reminder id.
+          await persistSpaceState(row, { space_state: tst, live_space_id: row.live_space_id, ended_at: twin.ended_at || new Date().toISOString() });
           return row;
         }
       } catch (e) {
@@ -605,7 +606,7 @@ async function refreshSpaceStateRow(row, req) {
       if (liveTwin && liveTwin.id) {
         await persistSpaceState(row, { space_state: 'live', live_space_id: liveTwin.id });
       } else if (endedTwin && endedTwin.id && t0 <= now) {
-        await persistSpaceState(row, { space_state: 'ended', live_space_id: null, ended_at: endedTwin.ended_at || new Date().toISOString() });
+        await persistSpaceState(row, { space_state: 'ended', live_space_id: endedTwin.id, ended_at: endedTwin.ended_at || new Date().toISOString() });
       }
     }
   } catch (e) {
