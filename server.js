@@ -150,7 +150,11 @@ app.get('/callback', async (req, res) => {
   const tok = await tr.json().catch(()=>({})); if (!tok.access_token) { console.error('TOKEN_ERROR', tr.status, JSON.stringify({error:tok.error,error_description:tok.error_description,title:tok.title,detail:tok.detail}), 'redirect_uri=', BASE + '/callback', 'cid_prefix=', (CID||'').slice(0,6), 'has_secret=', !!CSEC); return res.status(400).send('token error: ' + (tok.error_description || tok.error || tok.detail || tr.status)); }
   const me = (await (await fetch('https://api.x.com/2/users/me?user.fields=profile_image_url', { headers: { Authorization: 'Bearer ' + tok.access_token } })).json()).data;
   if (!(await recordLogin({ ...me, avatar: me.profile_image_url }))) return res.status(403).send(page(req, BANNED_HTML));
-  req.session.user = me; req.session.token = tok.access_token; // token kept in server-side session only, never logged
+  req.session.user = me;
+  // Access tokens expire ~2h; keep refresh_token (offline.access) so Spaces lookup keeps working.
+  req.session.token = tok.access_token;
+  if (tok.refresh_token) req.session.refresh_token = tok.refresh_token;
+  req.session.token_expires_at = Date.now() + Math.max(60, Number(tok.expires_in) || 7200) * 1000;
   req.session.save(() => res.redirect('/'));
 });
 app.get('/logout', (req, res) => req.session.destroy(() => res.redirect('/')));
@@ -234,28 +238,106 @@ else if(h==='archive'||h==='upcoming'){if(q.get('tab')!==h)go(h,host);}})()</scr
   res.send(page(req, filterBar + tabs + `<h2>${heading}</h2>` + (rows.length ? '<div class="grid">' + rows.map(card).join('') + '</div>' : empty), true));
 });
 // Extract a Space id from x.com/i/spaces/ID, twitter.com, reminder/share links (?id=, /spaces/ID/peek), or a bare id.
-const spaceIdOf = raw => { const t = String(raw || '').trim(); let m = /spaces\/([A-Za-z0-9]{8,20})/i.exec(t) || /[?&](?:space_?id|id)=([A-Za-z0-9]{8,20})/i.exec(t) || /^([A-Za-z0-9]{8,20})$/.exec(t) || /(?:^|[^A-Za-z0-9])(1[A-Za-z0-9]{12})(?![A-Za-z0-9])/.exec(t); return m ? m[1] : null; };
+const spaceIdOf = raw => {
+  const t = String(raw || '').trim();
+  let m = /(?:^|\/)(?:i\/)?spaces\/([A-Za-z0-9]{8,25})(?:\/|\?|#|$)/i.exec(t)
+    || /[?&](?:space_?id|id)=([A-Za-z0-9]{8,25})/i.exec(t)
+    || /^([A-Za-z0-9]{8,25})$/.exec(t)
+    || /(?:^|[^A-Za-z0-9])(1[A-Za-z0-9]{11,24})(?![A-Za-z0-9])/.exec(t);
+  return m ? m[1] : null;
+};
+// Follow one hop for t.co / x.com short links only (SSRF-safe allowlist).
+async function resolveSpaceId(raw) {
+  let id = spaceIdOf(raw); if (id) return id;
+  const t = String(raw || '').trim();
+  let u; try { u = new URL(t); } catch { return null; }
+  if (!/^(t\.co|x\.co)$/i.test(u.hostname)) return null;
+  try {
+    const r = await fetch(u.toString(), { method: 'GET', redirect: 'manual', headers: { 'User-Agent': 'SpacesBoard/1.0' } });
+    const loc = r.headers.get('location');
+    if (loc) return spaceIdOf(loc);
+  } catch {}
+  return null;
+}
+async function refreshUserToken(req) {
+  const rt = req.session.refresh_token;
+  if (!rt || !CID) return null;
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  if (CSEC) headers.Authorization = 'Basic ' + Buffer.from(`${CID}:${CSEC}`).toString('base64');
+  const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: rt, client_id: CID });
+  const r = await fetch('https://api.x.com/2/oauth2/token', { method: 'POST', headers, body });
+  const tok = await r.json().catch(() => ({}));
+  if (!r.ok || !tok.access_token) {
+    console.warn('TOKEN_REFRESH_FAIL', r.status, tok.error || tok.error_description || tok.detail || '');
+    // Spent/invalid refresh: force re-login for API calls.
+    delete req.session.token; delete req.session.refresh_token; delete req.session.token_expires_at;
+    return null;
+  }
+  req.session.token = tok.access_token;
+  if (tok.refresh_token) req.session.refresh_token = tok.refresh_token; // rotation
+  req.session.token_expires_at = Date.now() + Math.max(60, Number(tok.expires_in) || 7200) * 1000;
+  await new Promise((resolve, reject) => req.session.save(err => err ? reject(err) : resolve()));
+  return tok.access_token;
+}
+async function ensureAccessToken(req) {
+  if (!req.session.token && !req.session.refresh_token) return null;
+  const exp = Number(req.session.token_expires_at) || 0;
+  // Refresh 2 minutes early; also when expires_at unknown but refresh exists and token is old session.
+  if (req.session.token && exp && exp > Date.now() + 120e3) return req.session.token;
+  if (req.session.refresh_token) {
+    const t = await refreshUserToken(req);
+    if (t) return t;
+  }
+  return req.session.token || null;
+}
 const demoSpace = id => { const h = [...crypto.createHash('sha256').update(id).digest()];
   const topics = ['共創ナビ雑談','X API もくもく会','週末AIトーク','朝活コミュニティ会','クリエイター交流会','新機能おしゃべり'], hosts = ['NiziUcci','demo_host','demo_user','space_fan'];
   const d = new Date(Date.now() + (1 + h[2] % 6) * 864e5); d.setUTCHours(11 + h[3] % 3, 0, 0, 0); // 20:00-22:00 JST
   return { id, title: `【デモ】${topics[h[0] % topics.length]}`, scheduled_start: d.toISOString(), host: hosts[h[1] % hosts.length], state: 'scheduled', demo: true }; };
 async function lookupSpace(id, token) {
-  // Official space.fields: no recording/replay flag (twitter-api-v2 SpaceV2). Request ended_at + state; if a future field appears on the object, pick it up.
+  // Official space.fields only (no invented recording fields).
   const fields = 'title,scheduled_start,started_at,ended_at,creator_id,state,is_ticketed';
   const r = await fetch(`https://api.x.com/2/spaces/${encodeURIComponent(id)}?space.fields=${fields}&expansions=creator_id&user.fields=username,profile_image_url`, { headers: { Authorization: 'Bearer ' + token } });
-  const j = await r.json().catch(() => ({})); if (!r.ok || !j.data) throw new Error('lookup status ' + r.status);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.data) {
+    const detail = j.title || j.detail || j.errors?.[0]?.message || j.error || '';
+    const err = new Error('lookup status ' + r.status + (detail ? ': ' + detail : ''));
+    err.status = r.status; err.detail = detail; throw err;
+  }
   const cu = j.includes?.users?.find(u => u.id === j.data.creator_id); let host = cu?.username, avatar = cu?.profile_image_url;
   if (!host && j.data.creator_id) { const u = await (await fetch(`https://api.x.com/2/users/${j.data.creator_id}`, { headers: { Authorization: 'Bearer ' + token } })).json().catch(() => ({})); host = u.data?.username; }
   if (host && !avatar) try { avatar = (await (await fetch(`https://api.x.com/2/users/by/username/${encodeURIComponent(host)}?user.fields=profile_image_url`, { headers: { Authorization: 'Bearer ' + token } })).json()).data?.profile_image_url; } catch {}
   const d = j.data;
-  const replay = d.is_available_for_replay === true || d.isAvailableForReplay === true || d.has_recording === true;
-  return { id, title: d.title || '', scheduled_start: d.scheduled_start || d.started_at || null, ended_at: d.ended_at || null, host: host || '', avatar: avatar || null, state: d.state, has_recording: replay || null };
+  return { id, title: d.title || '', scheduled_start: d.scheduled_start || d.started_at || null, ended_at: d.ended_at || null, host: host || '', avatar: avatar || null, state: d.state };
+}
+async function lookupSpaceForReq(req, id) {
+  let token = await ensureAccessToken(req);
+  if (!token) { const e = new Error('no access token'); e.status = 401; throw e; }
+  try { return await lookupSpace(id, token); }
+  catch (e) {
+    // One retry after refresh on 401/403 (expired access token while session still valid).
+    if ((e.status === 401 || e.status === 403) && req.session.refresh_token) {
+      token = await refreshUserToken(req);
+      if (token) return await lookupSpace(id, token);
+      e.status = 401;
+    }
+    throw e;
+  }
 }
 app.get('/api/space', auth, async (req, res) => {
-  const id = spaceIdOf(req.query.url); if (!id) return res.status(400).json({ error: 'スペースIDが見つかりません。URLを確認してください。' });
+  const id = await resolveSpaceId(req.query.url); if (!id) return res.status(400).json({ error: 'スペースIDが見つかりません。URLを確認してください。' });
   if (DEMO) return res.json(demoSpace(id));
-  if (!req.session.token) return res.status(401).json({ id, error: 'ログインし直してください。' });
-  try { res.json(await lookupSpace(id, req.session.token)); } catch (e) { console.warn('space lookup failed'); res.status(502).json({ id, error: 'スペース情報を取得できませんでした。手入力してください。' }); }
+  try {
+    const sp = await lookupSpaceForReq(req, id);
+    res.json(sp);
+  } catch (e) {
+    const st = e.status || 502;
+    console.warn('space lookup failed', st, (e.message || '').slice(0, 160));
+    if (st === 401 || st === 403) return res.status(401).json({ id, error: 'ログインの有効期限が切れました。もう一度ログインしてください。', reauth: true });
+    if (st === 404 || st === 400) return res.status(404).json({ id, error: 'このスペースは取得できませんでした（終了・削除・非公開の可能性があります）。手入力もできます。' });
+    if (st === 429) return res.status(429).json({ id, error: 'X APIの利用上限に達しました。しばらくしてから再試行してください。' });
+    res.status(502).json({ id, error: 'スペース情報を取得できませんでした。手入力してください。' });
+  }
 });
 const NEWCSS = `<style>.af{display:none;margin-top:14px;border:1px solid var(--line);border-radius:16px;padding:14px;background:var(--inp)}.af.show{display:block}.af .row{display:flex;justify-content:space-between;align-items:center;gap:8px}.af .st{font-size:.85rem;color:var(--mut)}.form input[readonly]{opacity:.85;border-style:dashed}.hint{font-size:.78rem;color:var(--mut);margin-top:6px}.pv{display:flex;gap:12px;align-items:center;margin-top:10px}.pv .t{font-weight:700}.pv .m{font-size:.85rem;color:var(--time)}</style>`;
 app.get('/new', auth, (req, res) => res.send(page(req, `${NEWCSS}<h2><b>スペースを登録</b></h2><form class="form" method="post" action="/new" id="f">
@@ -277,16 +359,16 @@ document.getElementById('ed').onclick=function(){ro(false);T.focus()};
 function load(){var v=u.value.trim();if(!v||v===last)return Promise.resolve(ok);last=v;af.classList.add('show');st.textContent='⏳ スペース情報を取得中…';
 return fetch('/api/space?url='+encodeURIComponent(v)).then(function(r){return r.json().then(function(j){if(!r.ok)throw j;return j})}).then(function(j){T.value=j.title||'';if(j.scheduled_start)S.value=jst(j.scheduled_start);H.value=j.host||'';ro(true);ok=!!(j.title&&j.scheduled_start);
 st.textContent=ok?(j.demo?'✨ デモ値を自動入力しました（本物の取得はXログイン後）':'✅ 自動入力しました'):'⚠️ 一部取得できませんでした。編集して補ってください';if(!ok)ro(false);pv();return ok})
-.catch(function(e){ok=false;ro(false);st.textContent='⚠️ '+((e&&e.error)||'取得に失敗しました')+' 手入力もできます';pv();return false})}
+.catch(function(e){ok=false;ro(false);var msg=(e&&e.error)||'取得に失敗しました';if(e&&e.reauth){st.innerHTML='⚠️ '+msg+' <a href="/login">再ログイン</a>';}else{st.textContent='⚠️ '+msg+' 手入力もできます';}pv();return false})}
 u.addEventListener('change',load);u.addEventListener('blur',load);u.addEventListener('paste',function(){setTimeout(load,0)});
 f.addEventListener('submit',function(e){if(u.value.trim()!==last){e.preventDefault();load().then(function(){f.submit()})}});})()</script>`)));
 app.post('/new', auth, async (req, res) => {
-  const id = spaceIdOf(req.body.url); if (!id) return res.status(400).send(page(req, '<div class="msg">スペースIDが見つかりませんでした。URLを確認してください。 <a class="btn" href="/new">戻る</a></div>'));
+  const id = await resolveSpaceId(req.body.url); if (!id) return res.status(400).send(page(req, '<div class="msg">スペースIDが見つかりませんでした。URLを確認してください。 <a class="btn" href="/new">戻る</a></div>'));
   let { title, host, start } = req.body, avatar = null; let startIso = start ? new Date(start + '+09:00').toISOString() : null;
   let spaceState = null, endedAt = null, apiRec = false;
-  try { const sp = DEMO ? demoSpace(id) : req.session.token ? await lookupSpace(id, req.session.token) : null;
-    if (sp) { title = title || sp.title; startIso = startIso || sp.scheduled_start; host = host || sp.host; avatar = sp.avatar || null; spaceState = sp.state || null; endedAt = sp.ended_at || null; if (sp.has_recording) apiRec = true; } } catch (e) { console.warn('space lookup failed'); }
-  if (!avatar && !DEMO && req.session.token && (host || req.session.user.username)) try { const r = await fetch(`https://api.x.com/2/users/by/username/${encodeURIComponent(host || req.session.user.username)}?user.fields=profile_image_url`, { headers: { Authorization: 'Bearer ' + req.session.token } }); avatar = (await r.json()).data?.profile_image_url || null; } catch {}
+  try { const sp = DEMO ? demoSpace(id) : await lookupSpaceForReq(req, id);
+    if (sp) { title = title || sp.title; startIso = startIso || sp.scheduled_start; host = host || sp.host; avatar = sp.avatar || null; spaceState = sp.state || null; endedAt = sp.ended_at || null; if (sp.has_recording) apiRec = true; } } catch (e) { console.warn('space lookup failed', e.status || '', (e.message || '').slice(0, 120)); }
+  if (!avatar && !DEMO && (host || req.session.user.username)) try { const tok = await ensureAccessToken(req); if (tok) { const r = await fetch(`https://api.x.com/2/users/by/username/${encodeURIComponent(host || req.session.user.username)}?user.fields=profile_image_url`, { headers: { Authorization: 'Bearer ' + tok } }); avatar = (await r.json()).data?.profile_image_url || null; } } catch {}
   if (!title || !startIso) return res.status(400).send(page(req, '<div class="msg">タイトルと開始日時を取得できませんでした。「編集」から手入力してください。 <a class="btn" href="/new">戻る</a></div>'));
   const hasRec = (req.body.has_recording === '1' || req.body.has_recording === 'on' || apiRec) ? 1 : 0;
   let recUrl = String(req.body.recording_url || '').trim() || null;
@@ -345,9 +427,9 @@ app.post('/spaces/:id/refresh', auth, async (req, res) => {
   if (!csrfOk(req)) return res.status(403).send('CSRF error');
   const s = await db.prepare('SELECT * FROM spaces WHERE id=?').get(+req.params.id); if (!s) return res.redirect('/');
   if (s.owner_id !== req.session.user.id && !req.isAdmin) return res.sendStatus(403);
-  if (DEMO || !req.session.token) return res.redirect('/spaces/' + s.id + '/edit');
+  if (DEMO) return res.redirect('/spaces/' + s.id + '/edit');
   try {
-    const sp = await lookupSpace(s.space_id, req.session.token);
+    const sp = await lookupSpaceForReq(req, s.space_id);
     const patch = { space_state: sp.state || s.space_state, ended_at: sp.ended_at || s.ended_at, title: s.title || sp.title, host: s.host || sp.host };
     // Only auto-set has_recording when API explicitly says so (rare); never clear a manual flag.
     let hasRec = +s.has_recording; if (sp.has_recording === true) hasRec = 1;
