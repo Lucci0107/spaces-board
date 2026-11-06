@@ -232,7 +232,8 @@ app.get('/', async (req, res) => {
     const soon = !past && !live && !waiting && (new Date(s.start_at) - Date.now()) < 864e5;
     const today = !past && isTodayJst(s.start_at);
     const dt = new Date(s.start_at), jp = o => dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', ...o });
-    const openUrl = (past && s.recording_url && !s.live_space_id) ? s.recording_url : spaceOpenUrl(s);
+    // Archive/live open: live_space_id wins (spaceOpenUrl). Else explicit recording_url, else reminder space_id.
+    const openUrl = s.live_space_id ? spaceOpenUrl(s) : ((past && s.recording_url) ? s.recording_url : spaceOpenUrl(s));
     const statusChip = past ? `<span class="chip arc">🎙 アーカイブ</span>` : `<span class="chip ${live ? 'live' : (waiting || soon) ? 'soon' : ''}">${live ? '● LIVE' : waiting ? '⏳ 開始待ち' : soon ? '⏰ まもなく' : '📅 予定'}</span>`;
     const todayChip = today ? '<span class="chip today">🔥 本日</span>' : '';
     const own = uid && (s.owner_id === uid || req.isAdmin);
@@ -390,9 +391,14 @@ function parseSpacePublicHtml(id, html) {
   if (av) avatar = av[0].replace(/\\\//g, '/');
   const stRaw = (html.match(/\\?"state\\?"\s*:\s*\\?"(PrePublished|NotStarted|Running|Ended|Canceled|Live)\\?"/i) || [])[1] || '';
   const stateMap = { PrePublished: 'scheduled', NotStarted: 'scheduled', Running: 'live', Live: 'live', Ended: 'ended', Canceled: 'canceled' };
-  const state = stateMap[stRaw] || (stRaw ? stRaw.toLowerCase() : null);
+  let state = stateMap[stRaw] || (stRaw ? stRaw.toLowerCase() : null);
+  // og "Play recording" means the live room ended with a replay — reminder ids never show this.
+  const replay = /Play recording/i.test(og)
+    || /isReplayAvailable\s*:\s*!0/.test(html)
+    || /\\?"is_space_available_for_replay\\?"\s*:\s*true/i.test(html);
+  if (!state && replay) state = 'ended';
   if (!title && !scheduled_start && !host) { const e = new Error('public page parse empty'); e.status = 502; throw e; }
-  return { id, title: title || '', scheduled_start, ended_at: null, host: host || '', avatar, state, source: 'public_html' };
+  return { id, title: title || '', scheduled_start, ended_at: null, host: host || '', avatar, state, has_recording: replay ? true : null, source: 'public_html' };
 }
 async function lookupSpaceFromPublicPage(id) {
   const { status, html } = await fetchSpacePublicHtml(id);
@@ -550,11 +556,32 @@ async function persistSpaceState(row, patch) {
   const st = patch.space_state != null ? patch.space_state : row.space_state;
   const liveId = patch.live_space_id !== undefined ? patch.live_space_id : row.live_space_id;
   const endedAt = patch.ended_at !== undefined ? patch.ended_at : row.ended_at;
-  await db.prepare('UPDATE spaces SET space_state=?, live_space_id=?, ended_at=COALESCE(?, ended_at) WHERE id=?')
-    .run(st || null, liveId || null, endedAt || null, row.id);
+  let hasRec = patch.has_recording !== undefined ? patch.has_recording : row.has_recording;
+  let recUrl = patch.recording_url !== undefined ? patch.recording_url : row.recording_url;
+  // Prefer the live twin URL for recordings; never point recording_url at the reminder id when a twin exists.
+  if (liveId && (patch.has_recording === true || +hasRec || /Play recording/i.test(String(recUrl || '')))) {
+    hasRec = 1;
+    const twinUrl = `https://x.com/i/spaces/${liveId}`;
+    if (!recUrl || String(recUrl).includes(String(row.space_id || '___')) || !String(recUrl).includes(String(liveId))) {
+      recUrl = twinUrl;
+    }
+  }
+  await db.prepare('UPDATE spaces SET space_state=?, live_space_id=?, ended_at=COALESCE(?, ended_at), has_recording=COALESCE(?, has_recording), recording_url=COALESCE(?, recording_url) WHERE id=?')
+    .run(st || null, liveId || null, endedAt || null, hasRec != null ? (+hasRec ? 1 : 0) : null, recUrl || null, row.id);
   row.space_state = st || null;
   row.live_space_id = liveId || null;
   if (endedAt) row.ended_at = endedAt;
+  if (hasRec != null) row.has_recording = +hasRec ? 1 : 0;
+  if (recUrl) row.recording_url = recUrl;
+}
+function recordingPatchFromLookup(sp, liveId) {
+  if (!sp) return {};
+  const patch = {};
+  if (sp.has_recording === true && liveId) {
+    patch.has_recording = 1;
+    patch.recording_url = `https://x.com/i/spaces/${liveId}`;
+  }
+  return patch;
 }
 async function refreshSpaceStateRow(row, req) {
   const id = String(row.space_id || '');
@@ -573,8 +600,13 @@ async function refreshSpaceStateRow(row, req) {
           return row;
         }
         if (tst === 'ended' || tst === 'canceled') {
-          // Keep live_space_id so 開く still targets the real room/recording, not the reminder id.
-          await persistSpaceState(row, { space_state: tst, live_space_id: row.live_space_id, ended_at: twin.ended_at || new Date().toISOString() });
+          // Keep live_space_id so archive 開く / recording use the real room, not the reminder id.
+          await persistSpaceState(row, {
+            space_state: tst,
+            live_space_id: row.live_space_id,
+            ended_at: twin.ended_at || new Date().toISOString(),
+            ...recordingPatchFromLookup(twin, row.live_space_id),
+          });
           return row;
         }
       } catch (e) {
@@ -610,7 +642,17 @@ async function refreshSpaceStateRow(row, req) {
       if (liveTwin && liveTwin.id) {
         await persistSpaceState(row, { space_state: 'live', live_space_id: liveTwin.id });
       } else if (endedTwin && endedTwin.id && t0 <= now) {
-        await persistSpaceState(row, { space_state: 'ended', live_space_id: endedTwin.id, ended_at: endedTwin.ended_at || new Date().toISOString() });
+        let recPatch = {};
+        try {
+          const twinPage = await lookupSpaceFromPublicPage(endedTwin.id);
+          recPatch = recordingPatchFromLookup(twinPage, endedTwin.id);
+        } catch {}
+        await persistSpaceState(row, {
+          space_state: 'ended',
+          live_space_id: endedTwin.id,
+          ended_at: endedTwin.ended_at || new Date().toISOString(),
+          ...recPatch,
+        });
       }
     }
   } catch (e) {
@@ -624,7 +666,9 @@ async function refreshDueSpaceStates(rows, limit = 3, req) {
     const t = new Date(s.start_at).getTime();
     // Near/past start: 3h after scheduled start through 30m before.
     if (!(t >= now - 3 * 3600e3 && t <= now + 30 * 60e3)) return false;
-    if (s.space_state === 'ended' || s.space_state === 'canceled') return !s.live_space_id;
+    if (s.space_state === 'ended' || s.space_state === 'canceled') {
+      return !s.live_space_id || !s.recording_url;
+    }
     return true;
   })()).slice(0, limit);
   for (const row of due) await refreshSpaceStateRow(row, req);
@@ -732,12 +776,15 @@ app.post('/spaces/:id/refresh', auth, async (req, res) => {
   if (s.owner_id !== req.session.user.id && !req.isAdmin) return res.sendStatus(403);
   if (DEMO) return res.redirect('/spaces/' + s.id + '/edit');
   try {
-    const sp = await lookupSpaceForReq(req, s.space_id);
-    const patch = { space_state: sp.state || s.space_state, ended_at: sp.ended_at || s.ended_at, title: s.title || sp.title, host: s.host || sp.host };
-    // Only auto-set has_recording when API explicitly says so (rare); never clear a manual flag.
+    await refreshSpaceStateRow(s, req);
+    // Prefer looking up the live twin (may be 14-char → public HTML). Reminder id often stays scheduled.
+    const lookId = s.live_space_id || s.space_id;
+    const sp = await lookupSpaceForReq(req, lookId);
     let hasRec = +s.has_recording; if (sp.has_recording === true) hasRec = 1;
-    await db.prepare('UPDATE spaces SET space_state=?, ended_at=?, title=COALESCE(NULLIF(?,\'\'), title), host=COALESCE(NULLIF(?,\'\'), host), avatar=COALESCE(?, avatar), has_recording=? WHERE id=?')
-      .run(patch.space_state, patch.ended_at, sp.title || '', sp.host || '', sp.avatar || null, hasRec, s.id);
+    let recUrl = s.recording_url || null;
+    if (sp.has_recording === true && s.live_space_id) recUrl = `https://x.com/i/spaces/${s.live_space_id}`;
+    await db.prepare('UPDATE spaces SET space_state=COALESCE(?, space_state), ended_at=COALESCE(?, ended_at), title=COALESCE(NULLIF(?,\'\'), title), host=COALESCE(NULLIF(?,\'\'), host), avatar=COALESCE(?, avatar), has_recording=?, recording_url=COALESCE(?, recording_url), live_space_id=COALESCE(live_space_id, ?) WHERE id=?')
+      .run(normalizeSpaceState(sp.state) || null, sp.ended_at || null, sp.title || '', sp.host || '', sp.avatar || null, hasRec, recUrl, s.live_space_id || null, s.id);
   } catch (e) { console.warn('refresh failed', e.message); }
   res.redirect('/spaces/' + s.id + '/edit');
 });
@@ -793,10 +840,14 @@ setInterval(async () => { try {
   await pool.query('DELETE FROM sessions WHERE expire<now()');
   await pool.query(`UPDATE spaces SET space_state='ended', ended_at=COALESCE(ended_at, start_at + interval '1 hour')
     WHERE COALESCE(space_state,'') NOT IN ('ended','canceled') AND start_at < now() - interval '3 hours'`);
-  const due = await db.prepare(`SELECT id, space_id, live_space_id, demo, space_state, start_at, title, host, ended_at FROM spaces
+  const due = await db.prepare(`SELECT id, space_id, live_space_id, demo, space_state, start_at, title, host, ended_at, has_recording, recording_url FROM spaces
     WHERE COALESCE(demo,0)=0
       AND start_at >= now() - interval '3 hours' AND start_at <= now() + interval '30 minutes'
-      AND (COALESCE(space_state,'') NOT IN ('ended','canceled') OR live_space_id IS NULL)
+      AND (
+        COALESCE(space_state,'') NOT IN ('ended','canceled')
+        OR live_space_id IS NULL
+        OR recording_url IS NULL
+      )
     ORDER BY start_at LIMIT 5`).all();
   for (const row of due) await refreshSpaceStateRow(row);
 } catch (e) { console.error('maintenance job', e.message); }
