@@ -295,34 +295,110 @@ const demoSpace = id => { const h = [...crypto.createHash('sha256').update(id).d
   const d = new Date(Date.now() + (1 + h[2] % 6) * 864e5); d.setUTCHours(11 + h[3] % 3, 0, 0, 0); // 20:00-22:00 JST
   return { id, title: `【デモ】${topics[h[0] % topics.length]}`, scheduled_start: d.toISOString(), host: hosts[h[1] % hosts.length], state: 'scheduled', demo: true }; };
 async function lookupSpace(id, token) {
-  // Official space.fields only (no invented recording fields).
+  // Official space.fields only. API id pattern is ^[a-zA-Z0-9]{1,13}$ — 14+ char ids return 400.
   const fields = 'title,scheduled_start,started_at,ended_at,creator_id,state,is_ticketed';
   const r = await fetch(`https://api.x.com/2/spaces/${encodeURIComponent(id)}?space.fields=${fields}&expansions=creator_id&user.fields=username,profile_image_url`, { headers: { Authorization: 'Bearer ' + token } });
   const j = await r.json().catch(() => ({}));
   if (!r.ok || !j.data) {
     const detail = j.title || j.detail || j.errors?.[0]?.message || j.error || '';
     const err = new Error('lookup status ' + r.status + (detail ? ': ' + detail : ''));
-    err.status = r.status; err.detail = detail; throw err;
+    err.status = r.status; err.detail = detail;
+    err.invalidId = r.status === 400 && /does not match|Invalid Request|id query parameter/i.test(String(detail) + ' ' + JSON.stringify(j.errors || []));
+    throw err;
   }
   const cu = j.includes?.users?.find(u => u.id === j.data.creator_id); let host = cu?.username, avatar = cu?.profile_image_url;
   if (!host && j.data.creator_id) { const u = await (await fetch(`https://api.x.com/2/users/${j.data.creator_id}`, { headers: { Authorization: 'Bearer ' + token } })).json().catch(() => ({})); host = u.data?.username; }
   if (host && !avatar) try { avatar = (await (await fetch(`https://api.x.com/2/users/by/username/${encodeURIComponent(host)}?user.fields=profile_image_url`, { headers: { Authorization: 'Bearer ' + token } })).json()).data?.profile_image_url; } catch {}
   const d = j.data;
-  return { id, title: d.title || '', scheduled_start: d.scheduled_start || d.started_at || null, ended_at: d.ended_at || null, host: host || '', avatar: avatar || null, state: d.state };
+  return { id, title: d.title || '', scheduled_start: d.scheduled_start || d.started_at || null, ended_at: d.ended_at || null, host: host || '', avatar: avatar || null, state: d.state, source: 'api' };
+}
+// SSRF-safe: only build URL from already-parsed alphanumeric id; allowlist x.com/twitter.com; follow same-host /i/spaces redirects.
+async function fetchSpacePublicHtml(id) {
+  if (!/^[A-Za-z0-9]{8,25}$/.test(id)) { const e = new Error('bad id'); e.status = 400; throw e; }
+  const allow = /^(www\.)?(x\.com|twitter\.com)$/i;
+  const headers = { 'User-Agent': 'Mozilla/5.0 (compatible; SpacesBoard/1.0)', 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' };
+  let url = `https://x.com/i/spaces/${id}`;
+  for (let hop = 0; hop < 3; hop++) {
+    const r = await fetch(url, { method: 'GET', redirect: 'manual', headers });
+    if (r.status >= 300 && r.status < 400) {
+      const loc = r.headers.get('location'); if (!loc) break;
+      let next; try { next = new URL(loc, url); } catch { break; }
+      if (!allow.test(next.hostname) || !/^\/i\/spaces\/[A-Za-z0-9]{8,25}(\/|$)/i.test(next.pathname)) break;
+      url = next.toString(); continue;
+    }
+    const html = await r.text();
+    return { status: r.status, html, url };
+  }
+  const r = await fetch(url, { method: 'GET', redirect: 'follow', headers });
+  return { status: r.status, html: await r.text(), url: r.url };
+}
+function parseSpacePublicHtml(id, html) {
+  const og = (html.match(/property=["']og:title["']\s+content=["']([^"']*)["']/i) || html.match(/content=["']([^"']*)["']\s+property=["']og:title["']/i) || [])[1] || '';
+  if (/Audio Space Not Found/i.test(html) || /Audio Space Not Found/i.test(og) || /404 Error/i.test(og)) {
+    const e = new Error('space not found on public page'); e.status = 404; throw e;
+  }
+  let title = '';
+  if (og && !/Audio Space Not Found/i.test(og)) {
+    // EN + JA og prefixes used by x.com depending on Accept-Language
+    title = og.replace(/^(Scheduled|LIVE|Live|Ended|スケジュール済み|ライブ|配信中|終了):\s*/i, '').replace(/\s*\/\s*X\s*$/i, '').trim();
+  }
+  if (!title) {
+    // Embedded JSON often uses \"title\":\"...\"
+    const tm = html.match(/\\?"title\\?":\\?"((?:\\.|[^"\\])*)\\?"/);
+    if (tm) try { title = JSON.parse('"' + tm[1].replace(/\\"/g, '"') + '"'); } catch { title = tm[1].replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))); }
+  }
+  // SSR HTML embeds GraphQL JSON inside a JS string, so quotes are often backslash-escaped.
+  const msM = html.match(/\\?"scheduled_start\\?"\s*:\s*(\d{11,16})/);
+  const scheduled_start = msM ? new Date(+msM[1]).toISOString() : null;
+  let host = '';
+  const creator = (html.match(/name=["']twitter:creator["']\s+content=["']@?([^"']+)["']/i) || [])[1];
+  if (creator) host = creator.replace(/^@/, '');
+  if (!host) {
+    const sm = html.match(/\\?"screen_name\\?"\s*:\s*\\?"([A-Za-z0-9_]{1,40})\\?"/);
+    if (sm) host = sm[1];
+  }
+  let avatar = null;
+  const av = html.match(/https:\\\/\\\/pbs\.twimg\.com\\\/profile_images\\\/[0-9]+\\\/[A-Za-z0-9_-]+(?:_normal)?\.(?:jpg|jpeg|png|webp)/)
+    || html.match(/https:\/\/pbs\.twimg\.com\/profile_images\/[0-9]+\/[A-Za-z0-9_-]+(?:_normal)?\.(?:jpg|jpeg|png|webp)/);
+  if (av) avatar = av[0].replace(/\\\//g, '/');
+  const stRaw = (html.match(/\\?"state\\?"\s*:\s*\\?"(NotStarted|Running|Ended|Canceled|Live)\\?"/i) || [])[1] || '';
+  const stateMap = { NotStarted: 'scheduled', Running: 'live', Live: 'live', Ended: 'ended', Canceled: 'canceled' };
+  const state = stateMap[stRaw] || (stRaw ? stRaw.toLowerCase() : null);
+  if (!title && !scheduled_start && !host) { const e = new Error('public page parse empty'); e.status = 502; throw e; }
+  return { id, title: title || '', scheduled_start, ended_at: null, host: host || '', avatar, state, source: 'public_html' };
+}
+async function lookupSpaceFromPublicPage(id) {
+  const { status, html } = await fetchSpacePublicHtml(id);
+  if (status === 404) { const e = new Error('public page 404'); e.status = 404; throw e; }
+  return parseSpacePublicHtml(id, html);
 }
 async function lookupSpaceForReq(req, id) {
-  let token = await ensureAccessToken(req);
-  if (!token) { const e = new Error('no access token'); e.status = 401; throw e; }
-  try { return await lookupSpace(id, token); }
-  catch (e) {
-    // One retry after refresh on 401/403 (expired access token while session still valid).
-    if ((e.status === 401 || e.status === 403) && req.session.refresh_token) {
-      token = await refreshUserToken(req);
-      if (token) return await lookupSpace(id, token);
-      e.status = 401;
+  // Official API rejects ids longer than 13 chars (400 Invalid Request). Use public HTML fallback.
+  const useApi = String(id).length <= 13;
+  if (useApi) {
+    let token = await ensureAccessToken(req);
+    if (!token) { const e = new Error('no access token'); e.status = 401; throw e; }
+    try { return await lookupSpace(id, token); }
+    catch (e) {
+      if ((e.status === 401 || e.status === 403) && req.session.refresh_token) {
+        token = await refreshUserToken(req);
+        if (token) {
+          try { return await lookupSpace(id, token); }
+          catch (e2) { e = e2; }
+        } else { e.status = 401; }
+      }
+      // Fallback for invalid-id-pattern (400) or missing space (404).
+      if (e.status === 400 || e.status === 404 || e.invalidId) {
+        try { return await lookupSpaceFromPublicPage(id); }
+        catch (e3) {
+          if (e.status === 401 || e.status === 403) throw e;
+          throw e3.status ? e3 : e;
+        }
+      }
+      throw e;
     }
-    throw e;
   }
+  return await lookupSpaceFromPublicPage(id);
 }
 app.get('/api/space', auth, async (req, res) => {
   const id = await resolveSpaceId(req.query.url); if (!id) return res.status(400).json({ error: 'スペースIDが見つかりません。URLを確認してください。' });
@@ -334,7 +410,8 @@ app.get('/api/space', auth, async (req, res) => {
     const st = e.status || 502;
     console.warn('space lookup failed', st, (e.message || '').slice(0, 160));
     if (st === 401 || st === 403) return res.status(401).json({ id, error: 'ログインの有効期限が切れました。もう一度ログインしてください。', reauth: true });
-    if (st === 404 || st === 400) return res.status(404).json({ id, error: 'このスペースは取得できませんでした（終了・削除・非公開の可能性があります）。手入力もできます。' });
+    // Only real not-found (after public-page fallback) uses the ended/private copy — not raw API 400 id-pattern errors.
+    if (st === 404) return res.status(404).json({ id, error: 'このスペースは取得できませんでした（終了・削除・非公開の可能性があります）。手入力もできます。' });
     if (st === 429) return res.status(429).json({ id, error: 'X APIの利用上限に達しました。しばらくしてから再試行してください。' });
     res.status(502).json({ id, error: 'スペース情報を取得できませんでした。手入力してください。' });
   }
