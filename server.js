@@ -85,7 +85,7 @@ const csrfIn = req => `<input type="hidden" name="_csrf" value="${req.session.cs
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 const fmt = iso => new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) + ' (JST)';
 const fmtShort = iso => new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', weekday: 'short', hour: '2-digit', minute: '2-digit' });
-const rel = iso => { const m = Math.round((new Date(iso) - Date.now()) / 60e3); if (m <= 0 && m > -60) return 'LIVE'; if (m < 60) return `あと${m}分`; if (m < 1440) return `あと${Math.round(m/60)}時間`; return `あと${Math.round(m/1440)}日`; };
+const rel = iso => { const m = Math.round((new Date(iso) - Date.now()) / 60e3); if (m <= 0) return '開始後'; if (m < 60) return `あと${m}分`; if (m < 1440) return `あと${Math.round(m/60)}時間`; return `あと${Math.round(m/1440)}日`; };
 const CSS = `.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}:root,[data-theme=dark]{color-scheme:dark;--bg:#0a0a10;--card:#13131c;--line:#262634;--tx:#f1f1f6;--mut:#9b9bb0;--pu:#8b5cf6;--bl:#3b82f6;--pk:#ec4899;--glow:rgba(139,92,246,.16);--btn:#171722;--btnh:#1f1a30;--onbg:#2a1830;--ontx:#f5c2e7;--ntx:#d4ccf5;--sh:rgba(0,0,0,.35);--chbg:rgba(139,92,246,.12);--chbd:#6d4fd8;--chtx:#c4b5fd;--lvbg:#3b0d1d;--lvbd:#be185d;--lvtx:#fda4af;--sbg:#221b08;--sbd:#5c4a14;--stx:#fcd34d;--time:#a9a9be;--inp:#0e0e16;--ft:#5c5c75;--xbg:#ffffff;--xtx:#0a0a10;--seg:#14141d;--segon:#2a2a38;--segtx:#f1f1f6;--logo:#a78bfa;--tdbg:rgba(251,146,60,.12);--tdbd:#f59e0b;--tdtx:#fbbf24;--tdcard:#1a140c;--tdglow:rgba(245,158,11,.22)}
 [data-theme=light]{color-scheme:light;--bg:#f7f7fb;--card:#ffffff;--line:#e6e5ef;--tx:#14132a;--mut:#5f5d78;--pu:#7c3aed;--bl:#3b82f6;--pk:#db2777;--glow:rgba(124,58,237,.07);--btn:#ffffff;--btnh:#f5f1ff;--onbg:#fde7f3;--ontx:#9d174d;--ntx:#4c1d95;--sh:rgba(40,30,90,.07);--chbg:#f1ecff;--chbd:#e2d8fe;--chtx:#6d28d9;--lvbg:#ffe4ec;--lvbd:#f9a8c4;--lvtx:#be123c;--sbg:#fef6dc;--sbd:#f3d77a;--stx:#92600a;--time:#4b4a63;--inp:#f9f8fd;--ft:#8a88a3;--xbg:#0a0a10;--xtx:#ffffff;--seg:#ecebf3;--segon:#ffffff;--segtx:#14132a;--logo:#7c3aed;--tdbg:#fff7ed;--tdbd:#f59e0b;--tdtx:#b45309;--tdcard:#fffbf5;--tdglow:rgba(245,158,11,.18)}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 500px at 15% -10%,var(--glow) 0,transparent 60%),var(--bg);color:var(--tx);font-family:Inter,"Hiragino Sans","Noto Sans JP","Yu Gothic UI",system-ui,sans-serif;line-height:1.6;min-height:100vh;-webkit-font-smoothing:antialiased}
@@ -216,14 +216,19 @@ app.get('/', async (req, res) => {
   const arArgs = hostFilter ? [cutoff, hostFilter] : [cutoff];
   const upcoming = await db.prepare(`${base} WHERE start_at >= ? AND COALESCE(space_state,'') <> 'ended'${hostSql} ORDER BY start_at`).all(...upArgs);
   const archive = await db.prepare(`${base} WHERE has_recording=1 AND (ended_at IS NOT NULL OR space_state='ended' OR start_at < ?)${hostSql} ORDER BY COALESCE(ended_at, start_at) DESC`).all(...arArgs);
+  upcoming.forEach(s => { s.start_at = new Date(s.start_at).toISOString(); if (s.ended_at) s.ended_at = new Date(s.ended_at).toISOString(); });
+  archive.forEach(s => { s.start_at = new Date(s.start_at).toISOString(); if (s.ended_at) s.ended_at = new Date(s.ended_at).toISOString(); });
+  if (tab !== 'archive') await refreshDueSpaceStates(upcoming, 3, req);
   const rows = tab === 'archive' ? archive : upcoming;
-  rows.forEach(s => { s.start_at = new Date(s.start_at).toISOString(); if (s.ended_at) s.ended_at = new Date(s.ended_at).toISOString(); });
-  const card = s => { const past = tab === 'archive' || isPast(s); const r = rel(s.start_at), live = !past && r === 'LIVE', soon = !past && !live && (new Date(s.start_at) - Date.now()) < 864e5;
+  const card = s => { const past = tab === 'archive' || isPast(s); const r = rel(s.start_at);
+    // LIVE only when X says Running (stored space_state) — clock-due is 「開始待ち」, not LIVE.
+    const live = !past && s.space_state === 'live';
+    const waiting = !past && !live && new Date(s.start_at).getTime() <= Date.now();
+    const soon = !past && !live && !waiting && (new Date(s.start_at) - Date.now()) < 864e5;
     const today = !past && isTodayJst(s.start_at);
     const dt = new Date(s.start_at), jp = o => dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', ...o });
     const openUrl = (past && s.recording_url) ? s.recording_url : spaceOpenUrl(s);
-    // LIVE chip stays for live spaces; 「本日」 is an extra badge for JST calendar-today.
-    const statusChip = past ? `<span class="chip arc">🎙 アーカイブ</span>` : `<span class="chip ${live ? 'live' : soon ? 'soon' : ''}">${live ? '● LIVE' : soon ? '⏰ まもなく' : '📅 予定'}</span>`;
+    const statusChip = past ? `<span class="chip arc">🎙 アーカイブ</span>` : `<span class="chip ${live ? 'live' : (waiting || soon) ? 'soon' : ''}">${live ? '● LIVE' : waiting ? '⏳ 開始待ち' : soon ? '⏰ まもなく' : '📅 予定'}</span>`;
     const todayChip = today ? '<span class="chip today">🔥 本日</span>' : '';
     const own = uid && (s.owner_id === uid || req.isAdmin);
     const hName = String(s.host || '').replace(/^@/, '');
@@ -233,8 +238,8 @@ app.get('/', async (req, res) => {
     const backVal = hostFilter ? `${tab}|${hostFilter}` : tab;
     return `<article class="card${today ? ' today' : ''}"${today ? ' data-today="1"' : ''}><div class="date"><div class="d">${jp({ month: 'numeric', day: 'numeric' })}<small>${jp({ weekday: 'short' })}</small></div><div class="h">${jp({ hour: '2-digit', minute: '2-digit' })}</div></div><div class="body"><div class="top">${hostBtn}
 <div class="chips">${s.demo ? '<span class="chip s">サンプル</span>' : ''}${todayChip}${+s.has_recording && !past ? '<span class="chip arc">🎙 録音予定</span>' : ''}${statusChip}</div></div>
-<div class="title">${esc(s.title)}</div><div class="time"><span class="rel">${past ? '終了' : live ? '配信中' : r}</span><span>🕒 ${fmtShort(s.start_at)} JST</span></div></div>
-<div class="acts"><a class="btn pri" href="${esc(openUrl)}" target="_blank" rel="noopener">${past ? '▶ 録音を聴く' : '▶ 開く'}</a>${past ? '' : `<a class="btn" href="${gcal(s)}" target="_blank" rel="noopener">📅 Googleカレンダー</a><a class="btn" href="/spaces/${s.id}.ics">.ics</a><a class="btn" href="${esc(spaceOpenUrl(s))}" target="_blank" rel="noopener" title="Xのスペースページでネイティブのリマインドを設定">🔔 Xでリマインダー</a>`}
+<div class="title">${esc(s.title)}</div><div class="time"><span class="rel">${past ? '終了' : live ? '配信中' : waiting ? '開始待ち' : r}</span><span>🕒 ${fmtShort(s.start_at)} JST</span></div></div>
+<div class="acts"><a class="btn pri" href="${esc(openUrl)}">${past ? '▶ 録音を聴く' : '▶ 開く'}</a>${past ? '' : `<a class="btn" href="${gcal(s)}" target="_blank" rel="noopener">📅 Googleカレンダー</a><a class="btn" href="/spaces/${s.id}.ics">.ics</a><a class="btn" href="${esc(spaceOpenUrl(s))}" title="Xのスペースページでネイティブのリマインドを設定">🔔 Xでリマインダー</a>`}
 ${uid && own ? `<a class="btn" href="/spaces/${s.id}/edit">✏️ 編集</a><form method="post" action="/spaces/${s.id}/delete" onsubmit="return confirm('このスペースを削除しますか？')">${csrfIn(req)}<input type="hidden" name="back" value="${esc(backVal)}"><button class="btn">🗑 削除</button></form>` : ''}</div></article>`; };
   const tabs = `<div class="btabs" role="tablist" aria-label="表示切替"><a role="tab" href="${esc(boardHref('upcoming', hostFilter))}" aria-selected="${tab==='upcoming'}" id="tab-upcoming">これからの予定 <span class="n">${upcoming.length}</span></a><a role="tab" href="${esc(boardHref('archive', hostFilter))}" aria-selected="${tab==='archive'}" id="tab-archive">過去のアーカイブ <span class="n">${archive.length}</span></a></div>
 <script>(function(){var q=new URLSearchParams(location.search),h=location.hash.replace(/^#/,''),tab=q.get('tab')||'upcoming',host=q.get('host')||'';
@@ -378,8 +383,8 @@ function parseSpacePublicHtml(id, html) {
   const av = html.match(/https:\\\/\\\/pbs\.twimg\.com\\\/profile_images\\\/[0-9]+\\\/[A-Za-z0-9_-]+(?:_normal)?\.(?:jpg|jpeg|png|webp)/)
     || html.match(/https:\/\/pbs\.twimg\.com\/profile_images\/[0-9]+\/[A-Za-z0-9_-]+(?:_normal)?\.(?:jpg|jpeg|png|webp)/);
   if (av) avatar = av[0].replace(/\\\//g, '/');
-  const stRaw = (html.match(/\\?"state\\?"\s*:\s*\\?"(NotStarted|Running|Ended|Canceled|Live)\\?"/i) || [])[1] || '';
-  const stateMap = { NotStarted: 'scheduled', Running: 'live', Live: 'live', Ended: 'ended', Canceled: 'canceled' };
+  const stRaw = (html.match(/\\?"state\\?"\s*:\s*\\?"(PrePublished|NotStarted|Running|Ended|Canceled|Live)\\?"/i) || [])[1] || '';
+  const stateMap = { PrePublished: 'scheduled', NotStarted: 'scheduled', Running: 'live', Live: 'live', Ended: 'ended', Canceled: 'canceled' };
   const state = stateMap[stRaw] || (stRaw ? stRaw.toLowerCase() : null);
   if (!title && !scheduled_start && !host) { const e = new Error('public page parse empty'); e.status = 502; throw e; }
   return { id, title: title || '', scheduled_start, ended_at: null, host: host || '', avatar, state, source: 'public_html' };
@@ -416,6 +421,51 @@ async function lookupSpaceForReq(req, id) {
     }
   }
   return await lookupSpaceFromPublicPage(id);
+}
+const stateFetchedAt = new Map(); // space_id -> ms (throttle; one Render instance)
+function normalizeSpaceState(raw) {
+  if (!raw) return null;
+  const m = {
+    PrePublished: 'scheduled', NotStarted: 'scheduled', Running: 'live', Live: 'live',
+    Ended: 'ended', Canceled: 'canceled',
+    scheduled: 'scheduled', live: 'live', ended: 'ended', canceled: 'canceled',
+  };
+  return m[raw] || m[String(raw)] || String(raw).toLowerCase();
+}
+async function lookupSpaceState(id, req) {
+  // Prefer official API for <=13-char ids when a user token is available; else public HTML.
+  if (String(id).length <= 13 && req) {
+    try { return await lookupSpaceForReq(req, id); }
+    catch (e) { /* fall through to public page */ }
+  }
+  return await lookupSpaceFromPublicPage(id);
+}
+async function refreshSpaceStateRow(row, req) {
+  const id = String(row.space_id || '');
+  if (!id || row.demo) return row;
+  const now = Date.now();
+  if (now - (stateFetchedAt.get(id) || 0) < 60e3) return row;
+  stateFetchedAt.set(id, now);
+  try {
+    const sp = await lookupSpaceState(id, req);
+    const st = normalizeSpaceState(sp.state);
+    if (st) {
+      await db.prepare('UPDATE spaces SET space_state=? WHERE id=?').run(st, row.id);
+      row.space_state = st;
+    }
+  } catch (e) {
+    console.warn('state refresh', id, (e.message || '').slice(0, 120));
+  }
+  return row;
+}
+async function refreshDueSpaceStates(rows, limit = 3, req) {
+  const now = Date.now();
+  const due = rows.filter(s => !s.demo && s.space_id && (() => {
+    const t = new Date(s.start_at).getTime();
+    return t >= now - 2 * 3600e3 && t <= now + 30 * 60e3;
+  })()).slice(0, limit);
+  for (const row of due) await refreshSpaceStateRow(row, req);
+  return rows;
 }
 app.get('/api/space', auth, async (req, res) => {
   const id = await resolveSpaceId(req.query.url); if (!id) return res.status(400).json({ error: 'スペースIDが見つかりません。URLを確認してください。' });
@@ -580,6 +630,11 @@ setInterval(async () => { try {
   await pool.query('DELETE FROM sessions WHERE expire<now()');
   await pool.query(`UPDATE spaces SET space_state='ended', ended_at=COALESCE(ended_at, start_at + interval '1 hour')
     WHERE COALESCE(space_state,'') NOT IN ('ended','canceled') AND start_at < now() - interval '3 hours'`);
+  const due = await db.prepare(`SELECT id, space_id, demo, space_state, start_at FROM spaces
+    WHERE COALESCE(demo,0)=0 AND COALESCE(space_state,'') NOT IN ('ended','canceled')
+      AND start_at >= now() - interval '2 hours' AND start_at <= now() + interval '30 minutes'
+    ORDER BY start_at LIMIT 5`).all();
+  for (const row of due) await refreshSpaceStateRow(row);
 } catch (e) { console.error('maintenance job', e.message); }
 }, 60e3);
 app.listen(PORT, () => console.log(`Spaces Board on ${BASE} (demo=${DEMO})`));
