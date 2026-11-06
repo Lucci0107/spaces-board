@@ -594,8 +594,10 @@ async function refreshSpaceStateRow(row, req) {
         await persistSpaceState(row, { space_state: st, live_space_id: row.live_space_id || null, ended_at: sp.ended_at || new Date().toISOString() });
         // Fall through so we can still attach a twin recording id when missing.
         if (row.live_space_id) return row;
+      } else if (st && row.space_state !== 'ended' && row.space_state !== 'canceled') {
+        // Reminder ids often stay "scheduled" forever — never downgrade an ended/live twin mark from that alone.
+        await persistSpaceState(row, { space_state: st });
       }
-      if (st) await persistSpaceState(row, { space_state: st });
     } catch (e) {
       console.warn('state refresh', id, (e.message || '').slice(0, 120));
     }
