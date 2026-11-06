@@ -25,6 +25,7 @@ ALTER TABLE spaces ADD COLUMN IF NOT EXISTS has_recording INTEGER DEFAULT 0;
 ALTER TABLE spaces ADD COLUMN IF NOT EXISTS recording_url TEXT;
 ALTER TABLE spaces ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
 ALTER TABLE spaces ADD COLUMN IF NOT EXISTS space_state TEXT;
+ALTER TABLE spaces ADD COLUMN IF NOT EXISTS live_space_id TEXT;
 CREATE TABLE IF NOT EXISTS reminders(user_id TEXT, space_row INTEGER, minutes_before INTEGER DEFAULT 15, sent INTEGER DEFAULT 0, PRIMARY KEY(user_id, space_row));
 CREATE TABLE IF NOT EXISTS sessions(sid TEXT PRIMARY KEY, sess JSONB NOT NULL, expire TIMESTAMPTZ NOT NULL);`);
   // Normalize stored Space URLs so LIVE opens the room, not /peek reminders.
@@ -129,6 +130,9 @@ const spaceIdFromStored = s => {
 };
 // LIVE room URL — never /peek or share query params (those stay on the reminder page).
 const spaceOpenUrl = s => {
+  // Prefer the live twin id when a scheduled reminder id was replaced by a new Running room.
+  const live = String(s?.live_space_id || '').trim();
+  if (/^[A-Za-z0-9]{8,25}$/.test(live)) return `https://x.com/i/spaces/${live}`;
   const id = spaceIdFromStored(s);
   if (id) return `https://x.com/i/spaces/${id}`;
   return String(s?.url || '').replace(/\/peek(?=\?|$)/i, '').replace(/\?.*$/, '') || 'https://x.com/i/spaces';
@@ -362,7 +366,7 @@ function parseSpacePublicHtml(id, html) {
   let title = '';
   if (og && !/Audio Space Not Found/i.test(og)) {
     // EN + JA og prefixes used by x.com depending on Accept-Language
-    title = og.replace(/^(Scheduled|LIVE|Live|Ended|スケジュール済み|ライブ|配信中|終了):\s*/i, '').replace(/\s*\/\s*X\s*$/i, '').trim();
+    title = og.replace(/^(Scheduled|LIVE|Live|Ended|Play recording|スケジュール済み|ライブ|配信中|終了|再生):\s*/i, '').replace(/\s*\/\s*X\s*$/i, '').trim();
   }
   if (!title) {
     // Embedded JSON often uses \"title\":\"...\"
@@ -432,6 +436,30 @@ function normalizeSpaceState(raw) {
   };
   return m[raw] || m[String(raw)] || String(raw).toLowerCase();
 }
+function normalizeTitle(t) {
+  return String(t || '').replace(/[\u3000\s]+/g, ' ').trim().toLowerCase();
+}
+function titlesMatch(a, b) {
+  const x = normalizeTitle(a), y = normalizeTitle(b);
+  return !!x && !!y && x === y;
+}
+function pickTwinByState(candidates, ourTitle, ourStart, want) {
+  const pool = (candidates || []).filter(c => normalizeSpaceState(c.state) === want && c.id);
+  if (!pool.length) return null;
+  const exact = pool.find(c => titlesMatch(c.title, ourTitle));
+  if (exact) return exact;
+  if (pool.length === 1) {
+    const ours = new Date(ourStart).getTime();
+    const theirs = new Date(pool[0].started_at || pool[0].scheduled_start || 0).getTime();
+    if (ours && theirs && Math.abs(theirs - ours) <= 4 * 3600e3) return pool[0];
+    // Title exact already failed; still accept sole candidate when our start is past and want=ended/live.
+    if (ours && ours <= Date.now() + 30 * 60e3) return pool[0];
+  }
+  return null;
+}
+function pickLiveTwin(candidates, ourTitle, ourStart) {
+  return pickTwinByState(candidates, ourTitle, ourStart, 'live');
+}
 async function lookupSpaceState(id, req) {
   // Prefer official API for <=13-char ids when a user token is available; else public HTML.
   if (String(id).length <= 13 && req) {
@@ -440,6 +468,93 @@ async function lookupSpaceState(id, req) {
   }
   return await lookupSpaceFromPublicPage(id);
 }
+async function fetchHostPublicHtml(username) {
+  const host = String(username || '').replace(/^@/, '');
+  if (!/^[A-Za-z0-9_]{1,40}$/.test(host)) { const e = new Error('bad host'); e.status = 400; throw e; }
+  const allow = /^(www\.)?(x\.com|twitter\.com)$/i;
+  const headers = { 'User-Agent': 'Mozilla/5.0 (compatible; SpacesBoard/1.0)', 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' };
+  let url = `https://x.com/${host}`;
+  for (let hop = 0; hop < 3; hop++) {
+    const r = await fetch(url, { method: 'GET', redirect: 'manual', headers });
+    if (r.status >= 300 && r.status < 400) {
+      const loc = r.headers.get('location'); if (!loc) break;
+      let next; try { next = new URL(loc, url); } catch { break; }
+      if (!allow.test(next.hostname) || !/^\/[A-Za-z0-9_]{1,40}\/?$/i.test(next.pathname)) break;
+      url = next.toString(); continue;
+    }
+    return { status: r.status, html: await r.text(), url };
+  }
+  const r = await fetch(url, { method: 'GET', redirect: 'follow', headers });
+  return { status: r.status, html: await r.text(), url: r.url };
+}
+async function findLiveTwinViaCreatorApi(host, title, startAt, token) {
+  const h = String(host || '').replace(/^@/, '');
+  if (!token || !/^[A-Za-z0-9_]{1,40}$/.test(h)) return null;
+  const uRes = await fetch(`https://api.x.com/2/users/by/username/${encodeURIComponent(h)}`, { headers: { Authorization: 'Bearer ' + token } });
+  const uJ = await uRes.json().catch(() => ({}));
+  const uid = uJ.data?.id;
+  if (!uRes.ok || !uid) return null;
+  const fields = 'title,state,started_at,scheduled_start,creator_id';
+  const sRes = await fetch(`https://api.x.com/2/spaces/by/creator_ids?user_ids=${encodeURIComponent(uid)}&space.fields=${fields}`, { headers: { Authorization: 'Bearer ' + token } });
+  const sJ = await sRes.json().catch(() => ({}));
+  if (!sRes.ok) return null;
+  const rows = Array.isArray(sJ.data) ? sJ.data : (sJ.data ? [sJ.data] : []);
+  return pickLiveTwin(rows.map(d => ({ id: d.id, title: d.title || '', state: d.state, started_at: d.started_at, scheduled_start: d.scheduled_start })), title, startAt);
+}
+async function listTwinCandidatesFromHostPage(host, excludeId) {
+  const h = String(host || '').replace(/^@/, '');
+  if (!/^[A-Za-z0-9_]{1,40}$/.test(h)) return [];
+  const { status, html } = await fetchHostPublicHtml(h);
+  if (status >= 400 || !html) return [];
+  const ids = [...new Set([...html.matchAll(/\/i\/spaces\/([A-Za-z0-9]{8,25})/g)].map(m => m[1]))]
+    .filter(id => id && id !== excludeId)
+    .slice(0, 5);
+  const candidates = [];
+  for (const id of ids) {
+    try {
+      const sp = await lookupSpaceFromPublicPage(id);
+      candidates.push({ id, title: sp.title || '', state: sp.state, started_at: sp.scheduled_start, scheduled_start: sp.scheduled_start, ended_at: sp.ended_at });
+    } catch {}
+  }
+  return candidates;
+}
+async function resolveLiveTwin(row, req) {
+  const host = String(row.host || '').replace(/^@/, '');
+  const title = row.title || '';
+  const startAt = row.start_at;
+  if (!host) return { live: null, ended: null };
+  if (req) {
+    try {
+      const token = await ensureAccessToken(req);
+      if (token) {
+        const viaApi = await findLiveTwinViaCreatorApi(host, title, startAt, token);
+        if (viaApi) return { live: viaApi, ended: null };
+      }
+    } catch (e) {
+      console.warn('twin api', host, (e.message || '').slice(0, 100));
+    }
+  }
+  try {
+    const candidates = await listTwinCandidatesFromHostPage(host, String(row.space_id || ''));
+    return {
+      live: pickTwinByState(candidates, title, startAt, 'live'),
+      ended: pickTwinByState(candidates, title, startAt, 'ended'),
+    };
+  } catch (e) {
+    console.warn('twin host page', host, (e.message || '').slice(0, 100));
+    return { live: null, ended: null };
+  }
+}
+async function persistSpaceState(row, patch) {
+  const st = patch.space_state != null ? patch.space_state : row.space_state;
+  const liveId = patch.live_space_id !== undefined ? patch.live_space_id : row.live_space_id;
+  const endedAt = patch.ended_at !== undefined ? patch.ended_at : row.ended_at;
+  await db.prepare('UPDATE spaces SET space_state=?, live_space_id=?, ended_at=COALESCE(?, ended_at) WHERE id=?')
+    .run(st || null, liveId || null, endedAt || null, row.id);
+  row.space_state = st || null;
+  row.live_space_id = liveId || null;
+  if (endedAt) row.ended_at = endedAt;
+}
 async function refreshSpaceStateRow(row, req) {
   const id = String(row.space_id || '');
   if (!id || row.demo) return row;
@@ -447,11 +562,51 @@ async function refreshSpaceStateRow(row, req) {
   if (now - (stateFetchedAt.get(id) || 0) < 60e3) return row;
   stateFetchedAt.set(id, now);
   try {
-    const sp = await lookupSpaceState(id, req);
-    const st = normalizeSpaceState(sp.state);
-    if (st) {
-      await db.prepare('UPDATE spaces SET space_state=? WHERE id=?').run(st, row.id);
-      row.space_state = st;
+    // Re-check an already-known live twin (often 14-char; API get-by-id rejects it).
+    if (row.live_space_id) {
+      try {
+        const twin = await lookupSpaceFromPublicPage(String(row.live_space_id));
+        const tst = normalizeSpaceState(twin.state);
+        if (tst === 'live') {
+          await persistSpaceState(row, { space_state: 'live', live_space_id: row.live_space_id });
+          return row;
+        }
+        if (tst === 'ended' || tst === 'canceled') {
+          await persistSpaceState(row, { space_state: tst, live_space_id: null, ended_at: twin.ended_at || new Date().toISOString() });
+          return row;
+        }
+      } catch (e) {
+        console.warn('twin recheck', row.live_space_id, (e.message || '').slice(0, 100));
+      }
+    }
+
+    let st = null;
+    try {
+      const sp = await lookupSpaceState(id, req);
+      st = normalizeSpaceState(sp.state);
+      if (st === 'live') {
+        await persistSpaceState(row, { space_state: 'live', live_space_id: null });
+        return row;
+      }
+      if (st === 'ended' || st === 'canceled') {
+        await persistSpaceState(row, { space_state: st, live_space_id: null, ended_at: sp.ended_at || new Date().toISOString() });
+        return row;
+      }
+      if (st) await persistSpaceState(row, { space_state: st });
+    } catch (e) {
+      console.warn('state refresh', id, (e.message || '').slice(0, 120));
+    }
+
+    // Scheduled reminder ids often stay "scheduled" after go-live; X creates a NEW live id.
+    const t0 = new Date(row.start_at).getTime();
+    const near = t0 >= now - 3 * 3600e3 && t0 <= now + 30 * 60e3;
+    if (near && st !== 'live' && row.space_state !== 'live') {
+      const { live: liveTwin, ended: endedTwin } = await resolveLiveTwin(row, req);
+      if (liveTwin && liveTwin.id) {
+        await persistSpaceState(row, { space_state: 'live', live_space_id: liveTwin.id });
+      } else if (endedTwin && endedTwin.id && t0 <= now) {
+        await persistSpaceState(row, { space_state: 'ended', live_space_id: null, ended_at: endedTwin.ended_at || new Date().toISOString() });
+      }
     }
   } catch (e) {
     console.warn('state refresh', id, (e.message || '').slice(0, 120));
@@ -462,7 +617,8 @@ async function refreshDueSpaceStates(rows, limit = 3, req) {
   const now = Date.now();
   const due = rows.filter(s => !s.demo && s.space_id && (() => {
     const t = new Date(s.start_at).getTime();
-    return t >= now - 2 * 3600e3 && t <= now + 30 * 60e3;
+    // Near/past start: 3h after scheduled start through 30m before.
+    return t >= now - 3 * 3600e3 && t <= now + 30 * 60e3;
   })()).slice(0, limit);
   for (const row of due) await refreshSpaceStateRow(row, req);
   return rows;
@@ -630,9 +786,9 @@ setInterval(async () => { try {
   await pool.query('DELETE FROM sessions WHERE expire<now()');
   await pool.query(`UPDATE spaces SET space_state='ended', ended_at=COALESCE(ended_at, start_at + interval '1 hour')
     WHERE COALESCE(space_state,'') NOT IN ('ended','canceled') AND start_at < now() - interval '3 hours'`);
-  const due = await db.prepare(`SELECT id, space_id, demo, space_state, start_at FROM spaces
+  const due = await db.prepare(`SELECT id, space_id, live_space_id, demo, space_state, start_at, title, host FROM spaces
     WHERE COALESCE(demo,0)=0 AND COALESCE(space_state,'') NOT IN ('ended','canceled')
-      AND start_at >= now() - interval '2 hours' AND start_at <= now() + interval '30 minutes'
+      AND start_at >= now() - interval '3 hours' AND start_at <= now() + interval '30 minutes'
     ORDER BY start_at LIMIT 5`).all();
   for (const row of due) await refreshSpaceStateRow(row);
 } catch (e) { console.error('maintenance job', e.message); }
